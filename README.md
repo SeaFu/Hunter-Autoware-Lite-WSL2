@@ -1,90 +1,74 @@
-# Hunter 實車連線測試｜Windows 11 + WSL2 + USB-to-CAN
+# Hunter × Autoware-Lite Online｜Windows 11 + WSL2 雙 GUI 操作教學（v1.5.8）
 
-這份文件記錄 Hunter 移動機器人在 **Windows 11／WSL2（Ubuntu 18.04、ROS Melodic）** 的硬體連線驗證流程。
+這份專案說明 Hunter 移動機器人在 **Windows 11 / WSL2（Ubuntu 18.04、ROS Melodic）** 下的 CAN、VLP-16、NDT 建圖／定位與 Waypoint 路徑跟隨。教學設計給第一次接手的使用者，並與 [Autoware-Lite 離線版](https://github.com/SeaFu/autoware-lite) 分開。
 
-文件的目標是讓第一次接手的學弟能依序完成設定、知道每一步為什麼要做，以及判斷目前是否成功。**本專案與 [Autoware-Lite 離線版](https://github.com/SeaFu/autoware-lite) 分開**；這裡不需要 ROS bag 播放功能。
+**最短閱讀路線**：已有可用 CAN 核心與 ROS 環境 → 直接看 **[第 7 節：雙 GUI](#hunter-gui)**；換新電腦但需要 CAN 核心 → 在方式 A／B **二選一**，完成後再看第 7 節。無須將每一章的手動檢查命令都執行一遍。
 
-> [!CAUTION]
-> **目前這是一份實車「連線與唯讀診斷」指南，不是可直接讓 Hunter 自駕的操作手冊。**
->
-> CAN 封包可能關係到車體驅動、煞車與安全狀態。本文不提供 `cansend`、速度指令注入或解除保護機制的操作。測試時先讓車輪離地／置於不會移動的安全狀態，保留原廠急停與遙控器，並由熟悉車體的人員在場。
->
-> 看到 `can0` 不代表已收到 CAN 封包；收到 CAN 封包也不代表 Autoware 已經可以控制底盤。
+> [!IMPORTANT]
+> - **原先第 7～10 節的手動 USB/CAN/ROS 診斷已移至第 8～11 節，僅供 GUI 無法完成檢查時排錯或查閱歷史交接紀錄。** 一般使用請直接操作兩套 GUI，不必再重跑 `usbipd list`、`candump`、`rostopic hz`、`tcpdump` 等相同檢查。
+> - 本專案已在既有實驗環境實測過低速路徑跟隨與障礙停車；**v1.5.8 的完整組合、其他電腦的環境及數 m/s 高速安全性，仍需各自驗證**。GUI 顯示的目標巡航速度不等於硬體能達到的車速。
+> - GUI 的「停止自主導航」**不是實體急停**；實車操作必須保留可用的實體急停、遙控接管、失聯停車及現場人員監控。
 
 ## 目錄
 
 1. [已完成哪些測試](#1-已完成哪些測試)
-2. [整體通訊架構：ROS、Twist、CAN 的關係](#2-整體通訊架構rostwistcan-的關係)
+2. [整體通訊架構：ROS、NDT、Twist 與 CAN](#2-整體通訊架構rosndttwist-與-can)
 3. [另一台電腦是否需要重編 WSL2 核心](#3-另一台電腦是否需要重編-wsl2-核心)
-4. [Windows 11：安裝 USBIPD 並確認設備](#4-windows-11安裝-usbipd-並確認設備)
+4. [Windows 11：安裝 USBIPD（只需一次）](#4-windows-11安裝-usbipd-並確認設備)
 5. [方式 A：沿用已編好的 CAN 核心（推薦）](#5-方式-a沿用已編好的-can-核心推薦)
 6. [方式 B：從原始碼重新編譯核心（選用）](#6-方式-b從原始碼重新編譯核心選用)
-7. [USB-to-CAN 分享至 WSL2](#7-usb-to-can-分享至-wsl2)
-8. [WSL2：驗證 `can0` 與 CAN 接收](#8-wsl2驗證-can0-與-can-接收)
-9. [ROS 與 Autoware 的下一階段驗證](#9-ros-與-autoware-的下一階段驗證)
-10. [常見問題與還原方式](#10-常見問題與還原方式)
+7. [Windows + WSL2 雙 GUI 操作（v1.5.8）](#hunter-gui)
+8. [附錄 A：USB-to-CAN 手動分享（排錯用）](#appendix-usb-can)
+9. [附錄 B：WSL2 CAN 手動驗證（排錯用）](#appendix-wsl-can)
+10. [附錄 C：舊版 ROS/Twist 交接資訊](#appendix-legacy-ros)
+11. [附錄 D：常見問題與還原](#appendix-faq)
 
 ---
 
 ## 1. 已完成哪些測試
 
-以下記錄的是先前在原始測試筆電上觀察到的結果；**其他電腦需要重新驗證**。
+以下是**原實驗環境**累積的已知結果，換電腦時請在 GUI 內重新驗證，不要將原機結果直接當成新機通過。
 
-| 項目 | 已知結果 | 可以證明什麼 |
+| 項目 | 原實驗環境結果 | 對應 GUI 驗證 |
 | --- | --- | --- |
-| Windows 11 將 USB-to-CAN 分享給 WSL2 | `usbipd attach --wsl` 成功 | USB 裝置已轉交 WSL2 |
-| WSL2 辨識 USB 裝置 | `lsusb` 顯示 `1d50:606f OpenMoko, Inc.` | Linux 看得到 USB-to-CAN 轉接器 |
-| 舊版 WSL 核心 | `# CONFIG_CAN is not set`、`modprobe gs_usb` 失敗 | 原核心缺少所需 CAN／`gs_usb` 功能 |
-| 自行編譯 WSL 核心 | `uname -r` 顯示 `5.15.167.4-microsoft-standard-WSL2+` | 已成功載入自訂核心 |
-| 核心 CAN 功能 | `CONFIG_CAN`、`CAN_RAW`、`CAN_DEV`、`CAN_GS_USB` 均為 `y` | 所需功能已內建在核心 |
-| SocketCAN 介面 | `ip -br link` 顯示 `can0` | USB-to-CAN 已建立 Linux CAN 介面 |
-| CAN 封包 | 使用者表示已在 WSL2 讀到訊號 | 尚須在另一台電腦以 `candump` 和實際封包記錄複驗 |
-| ROS `/twist_cmd → /cmd_vel` | 有原版 `twiststamp` 與較安全的修正版程式 | 只能確認訊息轉換程式存在，**尚非實車閉迴路驗證** |
-| ROS `/cmd_vel → CAN → Hunter` | 尚未確認負責轉換的程序、CAN ID、封包格式 | **不可宣稱已完成實車控制** |
+| WSL2 CAN 核心 | 曾使用 `5.15.167.4-microsoft-standard-WSL2+`，CAN/gs_usb 編入核心 | 核心安裝參考第 5／6 節；CAN 接收看 WSL2 00 頁 |
+| USB-to-CAN | candleLight / OpenMoko `1d50:606f`，Windows `usbipd` 掛載成功 | Windows Bridge「掃描／Attach」 |
+| CAN 位元率與狀態 | 原機測試為 `can0`、500000 bps，能收到封包 | WSL2 00「啟動 can0」「讀取 8 筆 CAN」 |
+| Hunter ROS Driver | 曾成功接收 `/hunter_status`、`/odom` 並做低速人工控制測試 | WSL2 00「啟動 Hunter Driver」 |
+| VLP-16 | Windows UDP Relay 傳至 WSL2，ROS `/velodyne_points` 可更新 | Windows Relay `Forwarded` ＋ WSL2 00 Topic Hz |
+| NDT Mapping | 已成功輸出 PCD 地圖 | WSL2 02 頁 |
+| NDT Matching | 已顯示 PCD、即時 VLP-16 與 Hunter NDT 位姿 | WSL2 03 頁 |
+| Waypoint 跟隨 | 原機曾完成自主路徑跟隨，障礙停車／恢復經後續程式調整 | WSL2 04 頁；v1.5.8 與高速狀態須另行實測 |
 
-### 已知硬體資訊
+## 2. 整體通訊架構：ROS、NDT、Twist 與 CAN
 
-- USB-to-CAN：Windows 裝置列表曾顯示 `candleLight (USB to CAN adapter)`。
-- USB VID:PID：`1d50:606f`（Linux 顯示 `OpenMoko, Inc.`；辨識名稱不一定直接寫 CAN）。
-- 原機上的 Windows BUSID 曾為 `2-5`，**不是固定值**。
-- Ubuntu WSL 發行版名稱：`Autoware-18.04`，原機為 WSL2。
-- 改過的 WSL 核心：`5.15.167.4-microsoft-standard-WSL2+`。
-- **Hunter 的 CAN bitrate、CAN ID 與控制封包格式，目前未從交接文件或實際封包確認，本文不猜測。**
+**Windows 與 WSL2 各有一個 GUI，但硬體分成兩條獨立資料路徑**：
 
-## 2. 整體通訊架構：ROS、Twist、CAN 的關係
-
-### 2.1 Autoware 到底輸出什麼？
-
-當 Autoware 已完成定位、載入 Waypoint CSV、啟動 Pure Pursuit 與 Twist Filter：
-
-1. **Pure Pursuit** 依目前位姿與 Waypoint 產生追蹤所需的速度／轉向資訊。
-2. **Twist Filter** 處理控制命令，通常發布 `/twist_cmd`（`geometry_msgs/TwistStamped`）。
-3. **`twiststamp`** 訂閱 `/twist_cmd`，擷取 `linear.x` 與 `angular.z`，發布 `/cmd_vel`（`geometry_msgs/Twist`）。
-4. **仍需要一個獨立的底盤通訊程序**，把 `/cmd_vel` 轉成 Hunter 能理解的 CAN 訊框，送到 `can0`。目前不知道先前交接環境是哪個程序完成這一步，不能只因為過去「能動」就假設是 `twiststamp` 寫入 CAN。
-
-`twiststamp` **不會建立 `can0`，也不會自行對 CAN 匯流排送封包**。
-
-### 2.2 指令流向與感測回傳是兩個方向
+- **CAN**：Hunter → USB-to-CAN → Windows USB → `usbipd-win` → WSL2 `can0` → Hunter ROS Driver；車體速度命令由 ROS Driver 向底盤傳遞。
+- **VLP-16**：LiDAR Ethernet / UDP 2368 → Windows UDP Relay → WSL2 Velodyne Driver → `/velodyne_points` → NDT Mapping／Matching。
 
 ```mermaid
 flowchart TB
-    subgraph ROS["WSL2 · ROS / Autoware"]
-      A["Waypoint CSV + 定位"] --> B["Pure Pursuit / Twist Filter"]
-      B --> C["/twist_cmd · TwistStamped"]
-      C --> D["twiststamp → /cmd_vel · Twist"]
-      D -. "待確認：底盤轉換程式" .-> E["CAN 編碼／車體驅動"]
+    subgraph Win["Windows 11｜Bridge GUI"]
+      USB["USB-to-CAN / usbipd"]
+      UDP["VLP-16 UDP Relay"]
     end
-    E -. "待實測：發送 CAN 訊框" .-> F["SocketCAN can0"]
-    F <--> G["USB-to-CAN 轉接器"]
-    G <--> H["Hunter CAN 匯流排"]
+    subgraph WSL["WSL2｜Hunter Online GUI"]
+      CAN["can0 → Hunter ROS Driver"]
+      VLP["/velodyne_points"]
+      NDT["NDT 定位 /ndt_pose"]
+      PP["Waypoint → Pure Pursuit → Twist Filter"]
+      SUP["Navigation Supervisor"]
+    end
+    Hunter["Hunter 底盤"] <--> USB
+    USB <--> CAN
+    VLP16["VLP-16"] --> UDP --> VLP --> NDT --> PP --> SUP
+    PP --> SUP
+    SUP -->|"/cmd_vel（需具備運行條件）"| CAN
+    CAN <--> Hunter
 ```
 
-- **控制方向**：Autoware → ROS 速度訊息 →（底盤驅動／編碼）→ CAN → Hunter。
-- **回傳方向**：Hunter → CAN → USB-to-CAN → WSL2 `can0` →（底盤解碼）→ ROS 車體狀態／里程計。
-- **目前已著重完成**：Windows USB 分享、WSL2 自訂 CAN 核心，以及 `can0` 的設備辨識／接收測試。
-
-> [!NOTE]
-> VLP-16 使用的是**有線網路／UDP 點雲**，與 USB-to-CAN 是兩條獨立的硬體路徑。本 README 聚焦 USB-to-CAN；VLP-16 的網路 IP、UDP 2368、ROS Velodyne 驅動要另外驗證。
+> 原先的 `twiststamp` 是 `/twist_cmd` → `/cmd_vel` 的 ROS 訊息轉換範例，**不是直接對 CAN 送封包的程式**。目前的線上 GUI 使用獨立的導航橋接／Supervisor 與 Hunter ROS Driver；不要同時啟動第二套向 `/cmd_vel` 發布命令的控制流程。
 
 ## 3. 另一台電腦是否需要重編 WSL2 核心？
 
@@ -161,9 +145,9 @@ usbipd list
 - 第一個指令顯示版本號，而不是「`usbipd` 不是內部或外部命令」。
 - 第二個指令顯示 `BUSID`、`VID:PID`、`DEVICE`、`STATE` 欄位。
 
-### 4.2 找到 Hunter 的 USB-to-CAN
+### 4.2 找到 Hunter 的 USB-to-CAN（僅排錯：正常使用 Windows GUI）
 
-將 USB-to-CAN 接到 Windows 筆電 USB 埠，打開**系統管理員 PowerShell**：
+正常使用請直接開啟 **Windows Bridge GUI → 掃描 USB-CAN**，不需要執行以下命令。僅 GUI 無法辨識設備時，才將 USB-to-CAN 接到 Windows 筆電 USB 埠並開啟**系統管理員 PowerShell**進行排錯：
 
 ```powershell
 usbipd list
@@ -186,7 +170,7 @@ BUSID  VID:PID    DEVICE                            STATE
 
 ## 5. 方式 A：沿用已編好的 CAN 核心（推薦）
 
-**只有手上已有相容的 `bzImage-can`，才執行此節；成功後可直接跳到第 7 節。**
+**只有手上已有相容的 `bzImage-can`，才執行此節；成功後直接跳到第 7 節的 GUI 流程，不必再做後方附錄的手動 CAN 驗證。**
 
 ### 5.1 將核心檔案放到新電腦
 
@@ -276,7 +260,7 @@ CONFIG_CAN_DEV=y
 CONFIG_CAN_GS_USB=y
 ```
 
-如果顯示以上內容，代表正在使用自訂 CAN 核心，可以繼續第 7 節。**此時 `can0` 還未必存在**，因為 USB 裝置可能尚未掛載到 WSL。
+如果顯示以上內容，代表正在使用自訂 CAN 核心，可以直接繼續第 7 節的雙 GUI 操作。**此時 `can0` 還未必存在**，因為 USB 裝置可能尚未掛載到 WSL。
 
 `CONFIG_CAN_GS_USB=y` 的 `y` 表示**已編入核心**，所以不需要再執行 `sudo modprobe gs_usb`。原本看到 `Module gs_usb not found` 並不代表內建驅動失效。
 
@@ -378,11 +362,108 @@ sha256sum /mnt/d/WSLKernel/bzImage-can
 > [!TIP]
 > 你原先執行的 `cp -n` 代表**目標檔案已存在時不覆寫**。重新編譯新核心時，請另外命名，例如 `bzImage-can-test`，先保留目前可運作的 `bzImage-can` 作為回復版本。
 
-## 7. USB-to-CAN 分享至 WSL2
+<!-- HUNTER-GUI-V158-BEGIN -->
+<a id="hunter-gui"></a>
+## 7. Windows + WSL2 雙 GUI 操作（v1.5.8）
+
+完成 **[方式 A](#5-方式-a沿用已編好的-can-核心推薦)** 或 **[方式 B](#6-方式-b從原始碼重新編譯核心選用)** 其中一種後，從這一節繼續。**已有可用的 WSL2 CAN 核心、Hunter ROS 和 Autoware.AI 時，直接使用 GUI，不需重新安裝或編譯。**
+
+### 7.1 第一次使用：確認必要檔案與環境
+
+GitHub 儲存庫內應有以下目錄（**README 本身不會安裝 GUI，請連同 `gui/` 檔案一起上傳至 GitHub**）：
+
+```text
+autowareXhunter-lite/
+├── README.md
+├── gui/
+│   ├── Windows_Bridge/
+│   │   ├── hunter_bridge_gui.ps1
+│   │   └── udp_relay.ps1
+│   └── WSL2/
+│       ├── hunter_online_gui.py
+│       ├── aw_gui_core.py
+│       ├── offline_nav_bridge.py
+│       ├── hunter_nav_supervisor.py
+│       ├── hunter_motion_test.py
+│       ├── *.rviz
+│       └── launch/
+└── docs/
+    ├── GUI_一次性環境準備.md
+    ├── GUI_雙平台操作教學.md
+    └── GUI_故障排除.md
+```
+
+| 軟體 | 功能 | 何時處理 |
+| --- | --- | --- |
+| Windows 11 / `usbipd-win` | USB-CAN 裝置轉交 WSL2 | 第一次使用時安裝；可參考第 4 節 |
+| WSL2 Ubuntu 18.04 + CAN 核心 | SocketCAN `can0` | 第 5／6 節二選一；重開機不必重編 |
+| ROS Melodic、Hunter ROS、Velodyne、Autoware.AI | LiDAR／底盤 Driver、NDT、Pure Pursuit | 第一次環境建置；已有可用環境可略過 |
+| Windows Bridge／WSL2 GUI | 每天啟動與檢查 | 透過 GUI 操作，不必手動重跑底層測試 |
+
+若還未安裝 ROS／Autoware，可參考 [一次性環境準備](docs/GUI_一次性環境準備.md)。這些環境套件**不包含**在 GUI 程式包內。
+
+### 7.2 每次開機：Windows Bridge GUI
+
+在 Windows 專案根目錄開啟 PowerShell，執行**唯一必要的 GUI 啟動指令**：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\gui\Windows_Bridge\hunter_bridge_gui.ps1"
+```
+
+若 `.cmd` 被 Windows 關聯到記事本，直接使用上方指令即可。Windows GUI 請依序操作：
+
+1. **掃描 USB-CAN**：確認找到 candleLight `1d50:606f`；若尚未 Shared，才按 **Bind（管理員）**。
+2. **Attach CAN**：將 USB-to-CAN 分享給 WSL2；確認 Windows GUI 顯示 `Attached`。**不必另開 Terminal 執行 `usbipd list`。**
+3. **自動取得 WSL IP**：重啟 WSL2 後 IP 可能變動，請重新取得。
+4. **Start Relay**：VLP-16 UDP 預設 Port `2368`；以設備實際 IP 為準。確認 `Forwarded` 數量持續增加。**不必另開 `tcpdump`**。
+5. **安裝／更新 WSL GUI**：**只在第一次或 GitHub 程式更新後按一次**，會整包複製 `gui/WSL2` 至 `~/hunter_online_gui/`，避免漏掉相依 Python／launch／RViz。
+6. **開啟 WSL GUI**：下次沒有更新程式時直接開啟，不需要重新安裝。
+
+> Windows Bridge 請保持開啟，因為它管理 UDP Relay。**Attach CAN 成功不代表 CAN 已收到封包**；這件事交給 WSL2 00 頁檢查。
+
+### 7.3 WSL2 GUI：00～05 分頁
+
+| 分頁 | 正常操作 | 在 GUI 上確認什麼 |
+| --- | --- | --- |
+| **00 設備總覽** | 啟動 ROS Master → 啟動 `can0`（原機 500000 bps）→ 讀取 8 筆 CAN → 啟動 Hunter Driver → VLP-16 Driver | CAN RX、`/hunter_status`、點雲／Hunter Hz；無須額外 `candump`、`roscore`、`rostopic hz` |
+| **01 專案／TF** | 選擇 PCD 路徑、設定 `base_link → velodyne` 實測外參 → 套用／檢查 TF | 地圖與光達座標是否一致 |
+| **02 NDT 建圖** | 開始線上建圖 → 開啟建圖 RViz → 儲存 PCD | `/ndt_map` 與 Live VLP-16；成功輸出 PCD 地圖 |
+| **03 NDT 定位** | 載入 PCD → 開始線上定位 → 開啟定位 RViz | `/points_map`、`/velodyne_points`、`/ndt_pose` 持續更新並對齊 |
+| **04 Waypoint／路徑測試** | 選擇 Waypoint CSV、設定巡航速度／Pure Pursuit 參數 → 開啟導航 RViz → 開始／停止導航 | 地圖、即時點雲、Hunter 位置、路徑與控制狀態 |
+| **05 ROS Bag** | 需要記錄時才開始／停止 Bag | 錄製狀態與正常封存 |
+
+04 頁在**開始導航前**可以調整：
+
+- **目標巡航速度**：`0.05～5.00 m/s`，是設定值，不保證底盤實測能到達。
+- **Lookahead Ratio**：預設 `2.0`。
+- **Min Lookahead**：預設 `1.5 m`。
+
+Pure Pursuit、障礙物暫停／清除後續行及 NDT 自適應降速由導航模組處理；但這些保護與前向 LiDAR ROI **不是完整的高速避障認證**。在開始自主導航前，必須確認底盤實際能力、可靠的實體急停／遙控接管、定位更新、行駛空間及失聯停車機制。
+
+### 7.4 每日最短流程與異常排查
+
+**正常情況只要兩個 GUI**：Windows Bridge「掃描、Attach、取得 WSL IP、Start Relay、開啟 WSL GUI」→ WSL2 00 頁完成 CAN／Hunter／VLP-16 → 按需求使用 01～05 分頁。**已有可用環境時不必重編核心，也不必重做 Terminal 端的 CAN／ROS 驗證。**
+
+僅當 GUI 顯示故障、要追查驅動或 Topic 問題時，才看後面的手動診斷附錄：
+
+- [附錄 A：USB-CAN 手動掛載](#appendix-usb-can)
+- [附錄 B：WSL2 CAN 接收診斷](#appendix-wsl-can)
+- [附錄 C：舊版 ROS/Twist 交接](#appendix-legacy-ros)
+- [附錄 D：故障還原](#appendix-faq)
+
+進一步的 GUI 操作與故障情況，可參考 [雙平台詳細教學](docs/GUI_雙平台操作教學.md)、[GUI 故障排除](docs/GUI_故障排除.md)。
+
+---
+<!-- HUNTER-GUI-V158-END -->
+
+<a id="appendix-usb-can"></a>
+## 8. 附錄 A：USB-to-CAN 手動分享（排錯用）
+
+> **正常操作已整合於第 7 節 Windows Bridge GUI。** 以下為舊版手動流程，僅 GUI 無法掛載 USB-CAN 時使用。
 
 這一步要讓 Windows 的 USB 硬體被 WSL2 看見。**有核心，不代表已接上 USB 裝置**。
 
-### 7.1 Windows 管理員：綁定分享
+### 8.1 Windows 管理員：綁定分享
 
 先打開一個 Ubuntu WSL 終端機，讓 WSL2 VM 保持啟動。
 
@@ -404,7 +485,7 @@ usbipd list
 
 `bind` 通常只需對該裝置設定一次，設定會持續保存。換一台電腦或更換裝置後仍要重新檢查。
 
-### 7.2 Windows 一般權限：掛載到 WSL2
+### 8.2 Windows 一般權限：掛載到 WSL2
 
 在 **Windows 一般權限的 PowerShell／CMD** 執行（`2-5` 仍是範例）：
 
@@ -421,11 +502,14 @@ usbipd list
 
 完成後回到 WSL2 Ubuntu。
 
-## 8. WSL2：驗證 `can0` 與 CAN 接收
+<a id="appendix-wsl-can"></a>
+## 9. 附錄 B：WSL2 CAN 手動驗證（排錯用）
+
+> **正常操作請使用 WSL2 GUI 00「啟動 can0／讀取 8 筆 CAN」。** 以下為深度排錯時的手動診斷。原交接文件當時尚未確認 bitrate；目前原機已實測使用 **500000 bps**，但新車／新設備仍須確認。
 
 以下指令都在 **Ubuntu WSL2 終端機**執行。
 
-### 8.1 查看 USB 是否進入 Linux
+### 9.1 查看 USB 是否進入 Linux
 
 ```bash
 lsusb
@@ -441,7 +525,7 @@ Bus 001 Device 002: ID 1d50:606f OpenMoko, Inc.
 
 **成功判斷：**`lsusb -d 1d50:606f` 有顯示裝置。若只看到 Linux Foundation root hub，表示 USB 尚未順利掛載；先回去檢查 `usbipd list` 的 `STATE`。
 
-### 8.2 查看 `can0` 網路介面
+### 9.2 查看 `can0` 網路介面
 
 ```bash
 ip -br link
@@ -465,7 +549,7 @@ can0   DOWN    <NOARP,ECHO>
 dmesg | grep -Ei 'usb|gs_usb|can'
 ```
 
-### 8.3 確認 CAN bitrate，才啟用介面
+### 9.3 確認 CAN bitrate，才啟用介面
 
 **必須先從 Hunter 的交接資料／實車設定確認 CAN bitrate（bps）。目前尚未確認數值，因此本文不提供可直接照抄的固定 bitrate。**
 
@@ -487,7 +571,7 @@ fi
 
 **成功判斷：**`can0` 變為 `UP`，詳細資訊顯示所設定的 bitrate。若出現 `BUS-OFF`、大量錯誤或裝置斷線，停止測試並檢查接線、終端電阻與位元率。
 
-### 8.4 唯讀接收 CAN 封包
+### 9.4 唯讀接收 CAN 封包
 
 若系統沒有 `candump`，先安裝：
 
@@ -522,11 +606,14 @@ can0  123   [8]  00 00 00 00 00 00 00 00
 
 不需要、也不建議為了測試接收就先送出未知 CAN ID 或驅動命令。
 
-## 9. ROS 與 Autoware 的下一階段驗證
+<a id="appendix-legacy-ros"></a>
+## 10. 附錄 C：舊版 ROS/Twist 交接資訊
 
-### 9.1 目前保留的 ROS 訊息轉換程式
+> **以下記錄的是早期僅具 CAN 唯讀診斷時的交接觀察，不代表 v1.5.8 現況。** 目前已使用 Hunter ROS Driver 與導航 Supervisor 串接；日常導航請使用第 7 節 GUI，勿再啟動平行的 `/cmd_vel` 控制鏈。
 
-本倉庫的 [`examples/twiststamp_safe.py`](examples/twiststamp_safe.py) 是交接程式 `twiststamp` 的加強版範例：
+### 10.1 目前保留的 ROS 訊息轉換程式
+
+早期本倉庫的 [`examples/twiststamp_safe.py`](examples/twiststamp_safe.py) 是交接程式 `twiststamp` 的加強版範例：
 
 | 項目 | ROS 介面 |
 | --- | --- |
@@ -553,7 +640,7 @@ rostopic type /cmd_vel
 
 **只有在確認 `/cmd_vel` 沒有連接實車致動節點的隔離環境，才進行後續橋接程式測試。**
 
-### 9.2 為什麼還要找底盤驅動？
+### 10.2 為什麼還要找底盤驅動？
 
 你以前的流程是「載入 Waypoint CSV → NDT 定位 → Pure Pursuit → Twist Filter → `twiststamp` → 遙控器切自駕 → Hunter 行駛」，這是有價值的成功經驗。
 
@@ -568,7 +655,7 @@ rostopic type /cmd_vel
 
 在釐清之前，**不要直接把 `/cmd_vel` 連到任何新的 CAN 發送程式**。
 
-### 9.3 後續測試順序
+### 10.3 後續測試順序
 
 1. **硬體層**：`usbipd` → `lsusb` → `can0` → `candump`（本文件核心）。
 2. **CAN 協定層**：只讀辨識 Hunter 狀態回傳、確認 bitrate 與 CAN ID。
@@ -576,9 +663,10 @@ rostopic type /cmd_vel
 4. **隔離測試層**：在不接致動輸出的情況下測 `/twist_cmd → /cmd_vel` 與 timeout。
 5. **實車控制層**：完成電氣安全、軟硬體急停、斷線保護與現場監督後再制定專門 SOP。
 
-未來 Hunter 實車版 GUI 的重點應是硬體自檢、VLP-16 UDP、CAN 連線狀態、ROS Topic 健康狀態、錯誤記錄與安全停機；**不需要沿用離線版的 bag 播放工作流程**。
+目前 v1.5.8 的線上 GUI 已包含 CAN／VLP-16／ROS Topic 健康狀態、NDT、Waypoint、Bag 錄製等；**不需要沿用離線版的 bag 播放工作流程**。
 
-## 10. 常見問題與還原方式
+<a id="appendix-faq"></a>
+## 11. 附錄 D：常見問題與還原
 
 ### Q1：`lsusb` 有 `1d50:606f`，卻沒有 `can0`？
 
@@ -586,7 +674,7 @@ rostopic type /cmd_vel
 
 ### Q2：`can0` 是 `DOWN`，是不是失敗？
 
-不一定。這表示 Linux 已建立介面，但尚未啟用。先確認 Hunter bitrate，再依 8.3 設定；不要用未知 bitrate 亂試。
+不一定。這表示 Linux 已建立介面，但尚未啟用。先確認 Hunter bitrate，再依 9.3 設定；不要用未知 bitrate 亂試。
 
 ### Q3：有 `can0`，但 `candump` 沒封包？
 
@@ -642,4 +730,4 @@ usbipd list
 - [Microsoft｜WSL2-Linux-Kernel 原始碼與編譯說明](https://github.com/microsoft/WSL2-Linux-Kernel)
 - [Autoware-Lite｜離線建圖與導航驗證](https://github.com/SeaFu/autoware-lite)
 
-**紀錄原則**：本倉庫只把已驗證的步驟寫成「已完成」，其他實車功能標示為「待確認／待實測」，避免下一位使用者誤以為連上 CAN 就能安全啟動自駕。
+**紀錄原則**：歷史交接紀錄與目前 GUI 狀態應分別標示；僅將已經過實機驗證的功能寫成「已完成」。V1.5.8 或新電腦未經完整驗證的功能仍標示為「待實測」。

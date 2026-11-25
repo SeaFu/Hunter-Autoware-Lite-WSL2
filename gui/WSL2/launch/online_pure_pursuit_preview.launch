@@ -1,0 +1,21 @@
+<launch>
+  <arg name="min_lookahead" default="1.5" />
+  <arg name="lookahead_ratio" default="2.0" />
+  <!-- PREVIEW ONLY: output stays /offline_nav/*, NEVER remap to /cmd_vel. -->
+  <node pkg="pure_pursuit" type="pure_pursuit" name="hunter_preview_pure_pursuit" output="screen">
+    <param name="velocity_source" value="0" />
+    <param name="minimum_lookahead_distance" value="$(arg min_lookahead)" />
+    <param name="lookahead_ratio" value="$(arg lookahead_ratio)" />
+    <param name="publishes_for_steering_robot" value="true" />
+    <remap from="final_waypoints" to="/offline_nav/final_waypoints" />
+    <remap from="current_pose" to="/offline_nav/current_pose" />
+    <remap from="current_velocity" to="/offline_nav/current_velocity" />
+    <remap from="config/waypoint_follower" to="/offline_nav/config/waypoint_follower" />
+    <remap from="twist_raw" to="/offline_nav/twist_raw" />
+  </node>
+  <node pkg="twist_filter" type="twist_filter" name="hunter_preview_twist_filter" output="screen">
+    <remap from="twist_raw" to="/offline_nav/twist_raw" />
+    <remap from="config/twist_filter" to="/offline_nav/config/twist_filter" />
+    <remap from="twist_cmd" to="/offline_nav/twist_cmd" />
+  </node>
+</launch>
