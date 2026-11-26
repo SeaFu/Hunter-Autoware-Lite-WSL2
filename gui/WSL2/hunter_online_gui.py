@@ -29,7 +29,7 @@ HOME = os.path.expanduser('~')
 BUNDLE = os.path.dirname(os.path.abspath(__file__))
 SENSOR_TOPICS = ['/velodyne_points', '/hunter_status', '/odom', '/tf', '/tf_static', '/cmd_vel', '/points_raw', '/filtered_points', '/ndt_pose', '/ndt_stat', '/current_pose', '/hunter_nav/route', '/hunter_nav/safety_state', '/hunter_nav/applied_cmd', '/offline_nav/twist_cmd']
 HUNTER_SETUP = os.path.join(HOME, 'hunter_ws', 'devel', 'setup.bash')
-GUI_VERSION = '1.5.8'
+GUI_VERSION = '1.5.17'
 
 
 def ros_cmd(args, hunter=False):
@@ -75,6 +75,82 @@ def master_ok():
             socket.setdefaulttimeout(old)
     except Exception:
         return False
+
+
+def parse_hunter_auto_preflight(returncode, output):
+    """Interpret repeated actual /hunter_status reports, not GUI button state.
+
+    Only a stable tail of CAN-command mode (1) is accepted. A former motion
+    test is NOT sufficient to establish the current control mode, especially
+    after an operator switches back to remote control.
+    """
+    if returncode != 0:
+        return {'ok': False, 'mode': None, 'sample_count': 0,
+                'message': '無法讀取 /hunter_status 即時資料；請檢查 Hunter Driver、CAN RX 與 ROS 訊息。'}
+    modes = [int(x) for x in re.findall(r'^\s*control_mode:\s*(\d+)\s*$', output, re.M)]
+    if not modes:
+        return {'ok': False, 'mode': None, 'sample_count': 0,
+                'message': '/hunter_status 沒有 control_mode 欄位；無法確認底盤控制模式。'}
+    mode = modes[-1]
+    tail = modes[-min(5,len(modes)):]
+    stable_auto = all(value == 1 for value in tail)
+    if stable_auto:
+        return {'ok': True, 'mode': 1, 'sample_count': len(modes),
+                'message': 'Hunter 回報 CAN 指令模式 1；最近 {} 筆一致。'.format(len(tail))}
+    return {'ok': False, 'mode': mode, 'sample_count': len(modes),
+            'message': ('Hunter 最近 {} 筆模式回報：{}（最後={}).\n'
+                        '這是 Driver 的 CAN 控制模式回報，並非 GUI 判定遙控器開關位置。'
+                        '即使先前的 1 秒前進測試成功，也不能保證目前仍在 CAN 指令模式。'
+                        '將自動比對 can0 的原始 0x151 回饋，不會發送任何移動命令。'
+                        ).format(len(modes), ','.join(str(x) for x in modes[-10:]), mode)}
+
+
+def parse_hunter_can_mode_samples(output):
+    """Parse both modern candump -L ('151#...') and classic candump formats.
+
+    Hunter AGX_V1 status frame 0x151: byte[1] is control_mode.
+    This is read-only and never sends CAN traffic.
+    """
+    values=[]
+    for line in output.splitlines():
+        m=re.search(r'\b151#([0-9A-Fa-f]{4,16})\b', line)
+        if m:
+            values.append(int(m.group(1)[2:4], 16))
+            continue
+        m=re.search(r'\b151\s+\[8\]\s+([0-9A-Fa-f]{2})\s+([0-9A-Fa-f]{2})', line)
+        if m:
+            values.append(int(m.group(2),16))
+    return values
+
+
+def check_hunter_mode_report():
+    """Passive multi-sample mode check with independent CAN frame diagnosis."""
+    rc, out=run_cmd(['rostopic','echo','-n','12','/hunter_status'],timeout=7,ros=True)
+    result=parse_hunter_auto_preflight(rc,out)
+    if result.get('ok') and result.get('sample_count',0)<5:
+        result={'ok':False, 'mode':result.get('mode'), 'sample_count':result.get('sample_count',0),
+                'message':'Hunter 有回報 AUTO=1，但有效樣本少於 5 筆；先確認資料連續性。'}
+    # Report raw bus mode even when the ROS status is suspicious; use a passive
+    # candump, not a motion pulse or a remote-control command.
+    rc_can, raw = run_cmd(['candump','-L','-n','12','can0,151:7FF'],timeout=4)
+    raw_modes=parse_hunter_can_mode_samples(raw if rc_can==0 else '')
+    result['raw_can_modes']=raw_modes
+    if raw_modes:
+        uniq=sorted(set(raw_modes))
+        suffix='\nCAN 0x151 原始 mode(byte1)：{}（{}筆）。'.format(','.join(map(str,uniq)),len(raw_modes))
+        if result.get('mode') is not None and uniq==[result['mode']]:
+            suffix+=' ROS 與 CAN 回報一致。'
+        elif result.get('mode') is not None:
+            suffix+=' ROS 與 CAN 回報不一致，應檢查 Driver／訊息映射及取樣時間。'
+        # Never authorize hardware when raw mode and ROS status disagree, nor
+        # when mode switched to remote after status was sampled.
+        if result.get('ok') and any(value != 1 for value in raw_modes[-min(5,len(raw_modes)) :]):
+            result['ok']=False
+            suffix+=' CAN 原始回報不是穩定指令模式；啟動已取消。'
+        result['message']+=suffix
+    else:
+        result['message']+='\n暫無 CAN 0x151 原始取樣（確認 can-utils、can0 和訊息週期）。'
+    return result
 
 
 def status_snapshot():
@@ -416,8 +492,9 @@ class OnlineGUI(QMainWindow):
         if self.is_running('motion') or self.motion_active:
             self.log('已存在執行中的動作測試，禁止同時啟動第二個。');return
         script=os.path.join(BUNDLE,'hunter_motion_test.py')
+        if not os.path.isfile(script):script=os.path.join(HOME,'hunter_motion_test.py')
         if not os.path.isfile(script):
-            self.log('找不到隨 GUI 提供的測試程式：{}；請重新由 Windows Bridge 安裝完整 WSL2 目錄。'.format(script));return
+            self.log('找不到原有測試程式：{}，請先確認你先前的檔案。'.format(script));return
         if not self.is_running('hunter') and '/hunter_status' not in self.snapshot.get('topics',set()):
             self.log('找不到 Hunter Driver /hunter_status。');return
         self.motion_active=True
@@ -452,6 +529,7 @@ class OnlineGUI(QMainWindow):
         typed,ok=QInputDialog.getText(self,'第一階段授權','請輸入 RUN，讓腳本先進入零速度準備階段：')
         if not ok or typed!='RUN':self.motion_active=False;return
         script=os.path.join(BUNDLE,'hunter_motion_test.py')
+        if not os.path.isfile(script):script=os.path.join(HOME,'hunter_motion_test.py')
         if not self.start_proc('motion',['python2','-u',script,action],ros=True,hunter=True,stdin_data=b'RUN\n'):
             self.motion_active=False
         else:
@@ -1256,7 +1334,7 @@ class OnlineGUIV15(OnlineGUIV13):
                 QTimer.singleShot(900,self.open_nav_rviz)
                 return
         self.start_when_master('ndt_rviz_navigation',['rosrun','rviz','rviz','-d',path])
-        self.log('導航 RViz：綠色路徑、紅色終點、黃色 NDT 軌跡、PCD、即時 VLP-16、Hunter 估測位置。')
+        self.log('導航 RViz：綠色剩餘路徑、Waypoint (X,Y) 編號、黃色 NDT 軌跡、PCD 和 VLP-16。')
 
     def diagnose_route(self):
         def work():
@@ -1313,6 +1391,14 @@ class OnlineGUIV15(OnlineGUIV13):
         args=['python2','-u',supervisor,'--max-ndt-score',str(self.nav_ndt_score_limit.value())]
         if hasattr(self,'nav_cruise_speed'):
             args+=['--max-speed',str(self.applied_nav_speed())]
+        if hasattr(self,'nav_vehicle_width'):
+            args+=['--vehicle-width-m',str(self.nav_vehicle_width.value())]
+        if hasattr(self,'nav_corridor_half_width'):
+            args+=['--corridor-half-width-m',str(self.nav_corridor_half_width.value())]
+        if hasattr(self,'nav_cross_track_limit'):
+            args+=['--max-cross-track-m',str(self.nav_cross_track_limit.value())]
+        if hasattr(self,'nav_obstacle_stop_distance'):
+            args+=['--obstacle-stop-m',str(self.nav_obstacle_stop_distance.value())]
         args+=['--pose-timeout','1.0','--min-pose-hz','2.0']
         if hardware:args.append('--hardware')
         if not self.start_proc('nav_supervisor',args,hunter=True):return
@@ -1428,6 +1514,17 @@ class OnlineGUISimple(OnlineGUIV15):
         return (float(self.nav_lookahead_ratio.value()),
                 float(self.nav_min_lookahead.value()))
 
+    def use_recommended_pure_pursuit(self):
+        # Existing saved settings are not silently overwritten on upgrade.
+        # One deliberate click selects the comparison configuration.
+        if self.simple_request or self.is_running('nav_supervisor'):
+            self.log('實車導航正在執行，先停止後才能變更 Pure Pursuit 測試參數。')
+            return
+        self.nav_lookahead_ratio.setValue(1.17)
+        self.nav_min_lookahead.setValue(2.00)
+        self.apply_pure_pursuit_settings()
+        self.log('已選用建議比較值：Lookahead Ratio=1.17，Min Lookahead=2.00m。')
+
     def save_pure_pursuit_settings(self, _value=None):
         ratio,minimum=self.pure_pursuit_follow_values()
         self.settings.setValue('nav_lookahead_ratio',ratio)
@@ -1475,8 +1572,13 @@ class OnlineGUISimple(OnlineGUIV15):
         self.simple_request_t0=0.0
         self.simple_arm_sent=False
         super().__init__()
-        self.setWindowTitle('HUNTER / AUTOWARE-LITE ONLINE — 可調巡航與 Pure Pursuit v1.5.8')
-        self.log('v1.5.8：新增 Lookahead Ratio／Min Lookahead 設定；巡航速度、NDT 與障礙物控制策略保持不變。')
+        self.setWindowTitle('HUNTER / AUTOWARE-LITE ONLINE — 可調路徑走廊半寬 v1.5.18')
+        self.log('v1.5.12：自動比對 ROS 多筆 Hunter 模式與 CAN 0x151 原始回報；保留實車安全互鎖。')
+        self.log('v1.5.13：路徑障礙走廊改為車體實際最外寬 + 左右各0.15m；請先量測並核對RViz。')
+        self.log('v1.5.14：偏離路徑上限可設為1.00m；同時記錄完整/剩餘偏差、WP進度與曲率。')
+        self.log('v1.5.15：側牆回波依路徑分類；前方停車距離可由 GUI 設定，車體近前方仍防護。')
+        self.log('v1.5.17：修正啟動點在 WP01 前方時進度卡住；附加進度停滯停車保護。')
+        self.log('v1.5.18：Route Corridor Half Width 可由 GUI 調整；最低為車寬/2 + 0.15m。')
 
     def page_navigation(self):
         page=super().page_navigation()
@@ -1536,20 +1638,23 @@ class OnlineGUISimple(OnlineGUIV15):
         self.nav_lookahead_ratio.setRange(0.1,20.0)
         self.nav_lookahead_ratio.setDecimals(2)
         self.nav_lookahead_ratio.setSingleStep(0.1)
-        self.nav_lookahead_ratio.setValue(float(self.settings.value('nav_lookahead_ratio',2.0)))
-        self.nav_lookahead_ratio.setToolTip('預瞄比例；依速度影響預瞄距離，預設 2.0。')
+        self.nav_lookahead_ratio.setValue(float(self.settings.value('nav_lookahead_ratio',1.17)))
+        self.nav_lookahead_ratio.setToolTip('預瞄比例；本次比較建議 1.17，仍保留原本儲存設定。')
         followrow.addWidget(self.nav_lookahead_ratio)
         followrow.addWidget(QLabel('Min Lookahead (m)'))
         self.nav_min_lookahead=QDoubleSpinBox()
         self.nav_min_lookahead.setRange(0.1,30.0)
         self.nav_min_lookahead.setDecimals(2)
         self.nav_min_lookahead.setSingleStep(0.1)
-        self.nav_min_lookahead.setValue(float(self.settings.value('nav_min_lookahead',1.5)))
-        self.nav_min_lookahead.setToolTip('最小預瞄距離，預設 1.5m。')
+        self.nav_min_lookahead.setValue(float(self.settings.value('nav_min_lookahead',2.0)))
+        self.nav_min_lookahead.setToolTip('最小預瞄距離；本次比較建議 2.00m，仍保留原本儲存設定。')
         followrow.addWidget(self.nav_min_lookahead)
         self.nav_apply_lookahead_btn=QPushButton('套用 Pure Pursuit 參數')
         self.nav_apply_lookahead_btn.clicked.connect(self.apply_pure_pursuit_settings)
         followrow.addWidget(self.nav_apply_lookahead_btn)
+        self.nav_recommended_lookahead_btn=QPushButton('套用建議測試值 1.17 / 2.00m')
+        self.nav_recommended_lookahead_btn.clicked.connect(self.use_recommended_pure_pursuit)
+        followrow.addWidget(self.nav_recommended_lookahead_btn)
         body.layout().insertLayout(3,followrow)
         self.nav_lookahead_ratio.valueChanged.connect(self.save_pure_pursuit_settings)
         self.nav_min_lookahead.valueChanged.connect(self.save_pure_pursuit_settings)
@@ -1557,7 +1662,179 @@ class OnlineGUISimple(OnlineGUIV15):
                                     '若 Pure Pursuit 預覽已運作，可按「套用」重新發布。實車導航中請先停止再修改。')
         self.nav_follow_note.setWordWrap(True)
         body.layout().insertWidget(4,self.nav_follow_note)
+        widthrow=QHBoxLayout()
+        widthrow.addWidget(QLabel('車體最外寬 (m，含輪胎／外掛設備，請實際量測)'))
+        self.nav_vehicle_width=QDoubleSpinBox()
+        self.nav_vehicle_width.setRange(0.60,2.50)
+        self.nav_vehicle_width.setDecimals(2)
+        self.nav_vehicle_width.setSingleStep(0.02)
+        # This is a placeholder, NOT an independently verified Hunter width.
+        self.nav_vehicle_width.setValue(float(self.settings.value('nav_vehicle_width_m',0.80)))
+        self.nav_vehicle_width.setToolTip('請量測實際車體含輪胎/外掛設備最寬處。0.80m 僅是未核實的預設值。')
+        self.nav_vehicle_width.valueChanged.connect(self.update_nav_corridor_note)
+        widthrow.addWidget(self.nav_vehicle_width)
+        widthrow.addWidget(QLabel('Route Corridor Half Width (m)'))
+        self.nav_corridor_half_width=QDoubleSpinBox()
+        self.nav_corridor_half_width.setDecimals(2)
+        self.nav_corridor_half_width.setSingleStep(0.05)
+        self.nav_corridor_half_width.setRange(round(self.nav_vehicle_width.value()/2.0+0.15,2),1.75)
+        self.nav_corridor_half_width.setValue(float(self.settings.value(
+            'nav_corridor_half_width_m',self.nav_vehicle_width.value()/2.0+0.15)))
+        self.nav_corridor_half_width.setToolTip(
+            '藍色路徑走廊中心線到單側邊界距離。最小值=量測車寬/2+0.15m；'
+            '不等於牆面淨空或車體轉彎掃掠。開始導航後鎖定。')
+        self.nav_corridor_half_width.valueChanged.connect(self.save_corridor_half_width)
+        widthrow.addWidget(self.nav_corridor_half_width)
+        body.layout().insertLayout(5,widthrow)
+        self.nav_corridor_note=QLabel('')
+        self.nav_corridor_note.setWordWrap(True)
+        body.layout().insertWidget(6,self.nav_corridor_note)
+        self.update_nav_corridor_note(self.nav_vehicle_width.value())
+        devrow=QHBoxLayout()
+        devrow.addWidget(QLabel('偏離路徑停車門檻 (m；依剩餘路徑)'))
+        self.nav_cross_track_limit=QDoubleSpinBox()
+        self.nav_cross_track_limit.setRange(0.30,1.00)
+        self.nav_cross_track_limit.setDecimals(2)
+        self.nav_cross_track_limit.setSingleStep(0.05)
+        self.nav_cross_track_limit.setValue(1.00)
+        self.nav_cross_track_limit.setToolTip('本次設定 1.00m，從原本 0.45m 放寬；停車保護不是牆面淨空。啟動後鎖定。')
+        self.nav_cross_track_limit.valueChanged.connect(self.save_cross_track_limit)
+        devrow.addWidget(self.nav_cross_track_limit)
+        devrow.addWidget(QLabel('超限停車；完整/剩餘路徑偏差會同時記錄。窄走廊仍需確認實際車體碰撞空間。'))
+        body.layout().insertLayout(7,devrow)
+        obstacle_row=QHBoxLayout()
+        obstacle_row.addWidget(QLabel('前方障礙停車距離 (m；啟動前設定)'))
+        self.nav_obstacle_stop_distance=QDoubleSpinBox()
+        self.nav_obstacle_stop_distance.setRange(1.50,10.00)
+        self.nav_obstacle_stop_distance.setDecimals(2)
+        self.nav_obstacle_stop_distance.setSingleStep(0.10)
+        self.nav_obstacle_stop_distance.setValue(float(self.settings.value('nav_obstacle_stop_m',2.40)))
+        self.nav_obstacle_stop_distance.setToolTip('預設 2.40m；僅可在停止導航時調整，實際值可能被速度對應煞停模型提高。牆面若進入車體或路徑範圍仍需停止。')
+        self.nav_obstacle_stop_distance.valueChanged.connect(self.save_obstacle_stop_distance)
+        obstacle_row.addWidget(self.nav_obstacle_stop_distance)
+        obstacle_row.addWidget(QLabel('側牆在路徑外以橘色提示；車體近前方／行駛走廊內仍停車'))
+        body.layout().insertLayout(8,obstacle_row)
+        self.nav_obstacle_stop_note=QLabel('')
+        self.nav_obstacle_stop_note.setWordWrap(True)
+        body.layout().insertWidget(9,self.nav_obstacle_stop_note)
+        self.nav_cruise_speed.valueChanged.connect(lambda _:self.update_obstacle_stop_note())
+        self.update_obstacle_stop_note()
+        resetrow=QHBoxLayout()
+        self.nav_reset_progress_btn=QPushButton('重設 Waypoint 進度／從起點重跑（停車時）')
+        self.nav_reset_progress_btn.clicked.connect(self.reset_waypoint_progress)
+        resetrow.addWidget(self.nav_reset_progress_btn)
+        body.layout().insertLayout(10,resetrow)
+        mode_row=QHBoxLayout()
+        self.nav_mode_diag_btn=QPushButton('自動診斷 Hunter 控制模式（只讀）')
+        self.nav_mode_diag_btn.clicked.connect(self.diagnose_hunter_auto_mode)
+        mode_row.addWidget(self.nav_mode_diag_btn)
+        self.nav_mode_diag_label=QLabel('AUTO 訊號以 Hunter Driver 與 CAN 0x151 即時回報比對；診斷不會讓車移動。')
+        self.nav_mode_diag_label.setWordWrap(True)
+        mode_row.addWidget(self.nav_mode_diag_label)
+        body.layout().insertLayout(11,mode_row)
         return page
+
+    def save_cross_track_limit(self, value):
+        self.settings.setValue('nav_cross_track_limit_m',float(value))
+        if hasattr(self,'nav_cross_track_limit'):
+            self.log('已設定偏離路徑停車門檻 {:.2f}m；下次開始導航時生效。'.format(float(value)))
+
+    def save_obstacle_stop_distance(self, value):
+        self.settings.setValue('nav_obstacle_stop_m',float(value))
+        self.update_obstacle_stop_note()
+        self.log('前方障礙停車距離設為 {:.2f}m；下次開始導航時生效。'.format(float(value)))
+
+    def update_obstacle_stop_note(self):
+        if not hasattr(self,'nav_obstacle_stop_note'):
+            return
+        from nav_motion_policy import required_clearance
+        requested=float(self.nav_obstacle_stop_distance.value())
+        speed=float(self.nav_cruise_speed.value())
+        model_floor=required_clearance(speed,margin_m=1.0)
+        effective=max(requested,model_floor)
+        self.nav_obstacle_stop_note.setText(
+            '設定 {:.2f}m；依巡航上限 {:.2f}m/s 的簡化反應/煞停模型，實際生效至少 {:.2f}m。'
+            '此數值不是安全認證煞停距離；不會忽略侵入車體或轉彎掃掠範圍的牆面。'
+            '請確認 LiDAR→base_link 外參及實際可通行淨空。'.format(requested,speed,effective))
+
+    def save_corridor_half_width(self, half_width_m):
+        half_width_m=float(half_width_m)
+        self.settings.setValue('nav_corridor_half_width_m',half_width_m)
+        self.update_nav_corridor_note(self.nav_vehicle_width.value())
+        self.log('Route Corridor Half Width 設為 {:.2f}m；下次啟動導航生效。'.format(half_width_m))
+
+    def update_nav_corridor_note(self, vehicle_width_m):
+        vehicle_width_m=float(vehicle_width_m)
+        self.settings.setValue('nav_vehicle_width_m',vehicle_width_m)
+        minimum=round(vehicle_width_m/2.0+0.15,2)
+        if hasattr(self,'nav_corridor_half_width'):
+            # Constrain even persisted settings after changing measured width;
+            # the spinbox will emit valueChanged and update QSettings if raised.
+            self.nav_corridor_half_width.setMinimum(minimum)
+            half=self.nav_corridor_half_width.value()
+            self.settings.setValue('nav_corridor_half_width_m',half)
+        else:
+            half=minimum
+        if hasattr(self,'nav_corridor_note'):
+            self.nav_corridor_note.setText(
+                '藍色 Route Corridor：Half Width={:.2f}m，總寬={:.2f}m；'
+                '車寬={:.2f}m，每側額外保留 {:.2f}m（下限0.15m）。'
+                '紅色=走廊內候選，橘色=走廊外候選；此 ROI 並非完整的車體掃掠/防撞認證。'
+                '請在停止狀態下核對 RViz、光達外參與牆面實際淨空。'.format(
+                    half,2.0*half,vehicle_width_m,half-vehicle_width_m/2.0))
+
+    def reset_waypoint_progress(self):
+        if self.simple_request or self.is_running('nav_supervisor') or self.is_running('nav_gate'):
+            self.log('請先按「停止自主導航」後，才可以重設 Waypoint 進度。')
+            return
+        from nav_waypoint_progress import reset_progress
+        try:
+            csv_path=self.vpath(self.nav_path)
+            points=load_route(csv_path)
+            validate(points)
+            # Stop the bridge before changing the persisted progress, otherwise
+            # its in-memory tracker would overwrite the reset state.
+            if self.is_running('nav_bridge') or self.is_running('nav_preview'):
+                self.stop_nav_preview()
+            reset_progress(csv_path,points)
+            self.nav_loaded_path=None
+            self.log('Waypoint 進度已重設；下一次按「開始自主導航」會從 WP01 檢查起點。')
+        except (OSError,ValueError) as exc:
+            self.log('重設 Waypoint 進度失敗：'+str(exc))
+
+    def diagnose_hunter_auto_mode(self):
+        self.nav_mode_diag_btn.setEnabled(False)
+        self.nav_mode_diag_label.setText('正在被動讀取 /hunter_status 與 CAN 0x151，無車輛命令...')
+        self.async_task('Hunter AUTO 訊號診斷', check_hunter_mode_report,
+                        self._finish_mode_diagnostics)
+
+    def _finish_mode_diagnostics(self,result):
+        self.nav_mode_diag_btn.setEnabled(True)
+        message=result.get('message','診斷失敗')
+        self.nav_mode_diag_label.setText('目前狀態：' + ('CAN 指令模式已確認' if result.get('ok') else '模式未確認／需檢查回報'))
+        self.log('Hunter AUTO 自動診斷：'+message.replace('\n',' / '))
+        QMessageBox.information(self,'Hunter 模式自動診斷（只讀）', message)
+
+    def _check_hunter_auto_mode(self):
+        # Samples actual ROS status and raw CAN; NEVER moves the robot.
+        return check_hunter_mode_report()
+
+    def _finish_hunter_auto_mode_check(self, result):
+        # STOP may be pressed while the worker is running: never resume a
+        # cancelled navigation request from a delayed response.
+        if not self.simple_request:
+            return
+        if not result.get('ok', False):
+            message = result.get('message', 'Hunter AUTO 狀態未知')
+            self.simple_stop()
+            self.nav_note.setText('導航尚未開始：' + message.replace('\n', ' '))
+            self.log('啟動前 AUTO 檢查未通過：' + message.replace('\n', ' '))
+            QMessageBox.information(self, 'Hunter 控制模式回報尚未確認', message)
+            return
+        self.simple_request_t0 = time.monotonic()
+        self.log('Hunter AUTO=1 經多筆狀態確認，接著檢查 NDT 位姿與 Waypoint 起點。')
+        self.async_task('導航起點檢查', self._check_startpoint,
+                        self._finish_startpoint_check)
 
     def _check_startpoint(self):
         """One new NDT pose, route XY and yaw only. Never move the vehicle."""
@@ -1572,12 +1849,20 @@ class OnlineGUISimple(OnlineGUIV15):
     def _finish_startpoint_check(self, result):
         if not self.simple_request:return
         if result.get('ok'):
-            self.log('起點檢查通過：距離 {:.2f} m、Yaw 差 {:.2f} rad；準備導航。'.format(
-                result.get('distance_m',0),result.get('yaw_difference_rad',0)))
+            if result.get('resume'):
+                self.log('接續剩餘路徑：下一個 WP{:02d}/{}；距離剩餘路段 {:.2f}m。'.format(
+                    result.get('next_index',0)+1, result.get('waypoint_count',0),
+                    result.get('distance_m',0)))
+            else:
+                self.log('起點檢查通過：距離 {:.2f}m、Yaw 差 {:.2f}rad。'.format(
+                    result.get('distance_m',0),result.get('yaw_difference_rad',0)))
             self._simple_continue()
             return
         message=result.get('message','未通過起點檢查')
-        if result.get('type')=='too_far':
+        if result.get('type')=='too_far' and result.get('resume'):
+            message = (message + '\n需靠近剩餘路徑，不會自動跳回已走過的 Waypoint。')
+            QMessageBox.information(self,'請移到剩餘 Waypoint 附近',message)
+        elif result.get('type')=='too_far':
             message=('目前 Hunter 距離 Waypoint 起點 {:.2f} m，允許距離 {:.2f} m。\n'
                      '請先使用遙控器把 Hunter 移到起點附近，再按「開始自主導航」。\n\n'
                      '目前 NDT：({:.2f}, {:.2f})\n路徑起點：({:.2f}, {:.2f})').format(
@@ -1629,9 +1914,16 @@ class OnlineGUISimple(OnlineGUIV15):
         self.nav_cruise_speed.setEnabled(False)
         self.nav_lookahead_ratio.setEnabled(False)
         self.nav_min_lookahead.setEnabled(False)
+        self.nav_vehicle_width.setEnabled(False)
+        self.nav_corridor_half_width.setEnabled(False)
+        self.nav_cross_track_limit.setEnabled(False)
+        self.nav_obstacle_stop_distance.setEnabled(False)
         self.nav_apply_lookahead_btn.setEnabled(False)
-        self.log('開始自主導航：先取得最新 NDT 位姿並檢查 Waypoint 起點（只檢查 XY + Yaw）。')
-        self.async_task('導航起點檢查',self._check_startpoint,self._finish_startpoint_check)
+        self.nav_recommended_lookahead_btn.setEnabled(False)
+        self.log('開始自主導航：自動採樣 Hunter AUTO / CAN 0x151，再檢查 NDT 位姿和 Waypoint；'
+                 '不會在 AUTO 未確認時啟動導航控制節點。')
+        self.async_task('Hunter AUTO 啟動前檢查', self._check_hunter_auto_mode,
+                        self._finish_hunter_auto_mode_check)
 
     def _simple_continue(self):
         if not self.simple_request or self.simple_arm_sent:
@@ -1673,7 +1965,7 @@ class OnlineGUISimple(OnlineGUIV15):
             self.simple_start_btn.setEnabled(True)
         if hasattr(self,'nav_cruise_speed'):
             self.nav_cruise_speed.setEnabled(True)
-        for name in ('nav_lookahead_ratio','nav_min_lookahead','nav_apply_lookahead_btn'):
+        for name in ('nav_lookahead_ratio','nav_min_lookahead','nav_apply_lookahead_btn','nav_recommended_lookahead_btn','nav_vehicle_width','nav_corridor_half_width','nav_cross_track_limit','nav_obstacle_stop_distance'):
             if hasattr(self,name):getattr(self,name).setEnabled(True)
         self.stop_hardware_nav()
         # Important: leave NDT/ROS/sensors running so the operator can inspect
@@ -1686,7 +1978,7 @@ class OnlineGUISimple(OnlineGUIV15):
             self.simple_start_btn.setEnabled(True)
         if hasattr(self,'nav_cruise_speed'):
             self.nav_cruise_speed.setEnabled(True)
-        for name in ('nav_lookahead_ratio','nav_min_lookahead','nav_apply_lookahead_btn'):
+        for name in ('nav_lookahead_ratio','nav_min_lookahead','nav_apply_lookahead_btn','nav_recommended_lookahead_btn','nav_vehicle_width','nav_corridor_half_width','nav_cross_track_limit','nav_obstacle_stop_distance'):
             if hasattr(self,name):getattr(self,name).setEnabled(True)
         super().stop_hardware_nav()
 

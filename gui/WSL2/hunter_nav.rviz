@@ -89,14 +89,39 @@ Visualization Manager:
     Value: true
   - Class: rviz/Path
     Enabled: true
-    Name: Planned Waypoint Route (green)
-    Topic: /hunter_nav/route
+    Name: Remaining Waypoint Route (green)
+    Topic: /hunter_nav/remaining_route
     Color: 70; 245; 100
     Alpha: 1.0
     Buffer Length: 1
     Line Style: Lines
     Line Width: 0.1
     Pose Style: None
+    Value: true
+  - Class: rviz/Path
+    Enabled: false
+    Name: Full Planned Route (optional)
+    Topic: /hunter_nav/route
+    Color: 152; 159; 168
+    Alpha: 0.45
+    Buffer Length: 1
+    Line Style: Lines
+    Line Width: 0.04
+    Pose Style: None
+    Value: false
+  - Class: rviz/MarkerArray
+    Enabled: true
+    Name: Waypoint XY Coordinates + Number
+    Marker Topic: /hunter_nav/waypoint_markers
+    Queue Size: 10
+    Namespaces: {}
+    Value: true
+  - Class: rviz/MarkerArray
+    Enabled: true
+    Name: Route Corridor + Obstacle Diagnostics
+    Marker Topic: /hunter_nav/obstacle_markers
+    Queue Size: 10
+    Namespaces: {}
     Value: true
   - Class: rviz/Path
     Enabled: true
