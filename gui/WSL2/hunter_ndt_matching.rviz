@@ -123,6 +123,13 @@ Visualization Manager:
     Shape: Arrow
     Topic: /ndt_pose
     Value: true
+  - Class: rviz/MarkerArray
+    Enabled: true
+    Name: Trajectory Feasibility (green/yellow/red/gray)
+    Marker Topic: /hunter_nav/feasibility_markers
+    Queue Size: 10
+    Namespaces: {}
+    Value: true
   - Class: rviz/Axes
     Enabled: true
     Length: 1.5

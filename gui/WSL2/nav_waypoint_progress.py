@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+from nav_ordered_lookahead import local_station
 
 
 def fingerprint(points):
@@ -75,6 +76,52 @@ def distance_to_remaining(points, next_index, x, y, max_forward_segments=None):
     return best, heading
 
 
+def remaining_path_length(points, next_index, x, y):
+    """Arc length remaining, projected ONLY onto the current incoming segment.
+
+    A closed loop has near-zero endpoint distance at WP01, but its remaining
+    arc is still the entire route. Never project onto a distant future leg.
+    """
+    if len(points) < 2 or not 0 <= next_index < len(points):
+        raise ValueError('Invalid route/progress for remaining length')
+    i = max(0, next_index - 1)
+    a, b = points[i], points[i + 1]
+    dx, dy = b['x'] - a['x'], b['y'] - a['y']
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        raise ValueError('Degenerate route segment')
+    along = ((x-a['x'])*dx + (y-a['y'])*dy) / length
+    along = max(0.0, min(length, along))
+    return length - along + sum(
+        math.hypot(q['x']-p['x'], q['y']-p['y'])
+        for p, q in zip(points[i+1:], points[i+2:]))
+
+
+def final_waypoint_reached(points, next_index, x, y, yaw):
+    """Completion requires ordered progress AND reaching the final segment end.
+
+    The 0.55m XY envelope is retained only as an additional upper bound.
+    The local along-track gate prevents stopping at the start of a short
+    final segment, even when both endpoints fit within that envelope.
+    """
+    if len(points) < 3 or next_index != len(points)-1:
+        return False
+    a, b = points[-2], points[-1]
+    dx, dy = b['x']-a['x'], b['y']-a['y']
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        return False
+    ex, ey = x-a['x'], y-a['y']
+    along = (ex*dx+ey*dy)/length
+    lateral = abs(ex*dy-ey*dx)/length
+    margin = min(0.06, 0.20*length)
+    reach = min(0.30, max(0.08, 0.70*length))
+    heading = math.atan2(dy, dx)
+    error = abs(math.atan2(math.sin(yaw-heading), math.cos(yaw-heading)))
+    return (along >= length-margin and lateral <= reach and error <= 0.70
+            and math.hypot(x-b['x'], y-b['y']) <= 0.55)
+
+
 class ProgressTracker(object):
     """Track cumulative XY distance along the locally nearest *future* segment.
 
@@ -109,12 +156,21 @@ class ProgressTracker(object):
         spacing=min(distances) if distances else self.reach_m
         return min(self.reach_m,0.30,max(0.08,0.70*spacing))
 
+    def gate_reach(self,index):
+        # A checkpoint is a local cross-section, not a tiny XY circle.
+        # Allow modest lateral tracking error on an Ackermann bend, while
+        # remaining tighter than the normal route deviation STOP limit.
+        return min(self.reach_m,max(.40,self.local_reach(index)))
+
     def update(self, x, y, following, yaw=None):
         if not following or self.completed:
             return False
         n=len(self.points)
         old=self.next_index
-        if old>=n:
+        # The final WP remains pending until the supervisor has independently
+        # checked the final segment and stopped. Only its GOAL acknowledgement
+        # may mark this run as complete/reset the persisted index.
+        if old>=n-1:
             return False
         # The GUI permits a starting position roughly 0.30 m from WP01.
         # Requiring the robot to enter a smaller *circle* around WP01 after
@@ -134,7 +190,9 @@ class ProgressTracker(object):
             lateral=abs(ex*dy-ey*dx)/length
             # Allow a modest amount beyond WP02 to handle delayed first ACTIVE
             # after the starting alignment check, but not a remote waypoint.
-            if along < -0.05 or along > min(0.65,length+0.12):
+            # Match the existing 0.50m START alignment allowance when the
+            # first segment is short (e.g. 0.25m). No index may be skipped.
+            if along < -0.05 or along > min(0.65,max(0.50,length+0.12)):
                 return False
             if lateral > min(0.30,max(0.13,self.local_reach(0))):
                 return False
@@ -144,31 +202,17 @@ class ProgressTracker(object):
                     return False
             self.next_index=1
             return True
-        # Only inspect the immediately preceding and current segments. The
-        # previous implementation searched four FUTURE segments and allowed up
-        # to three waypoint advances from a single pose, which can jump across
-        # tightly folded lanes.
-        begin=max(0,old-1)
-        end=min(n-1,old+1)
-        best_d,best_s=float('inf'),None
-        for i in range(begin,end):
-            a,b=self.points[i],self.points[i+1]
-            dx,dy=b['x']-a['x'],b['y']-a['y']
-            d2=dx*dx+dy*dy
-            if d2<=1e-9:
-                continue
-            seg_heading=math.atan2(dy,dx)
-            if yaw is not None:
-                heading_error=math.atan2(math.sin(yaw-seg_heading), math.cos(yaw-seg_heading))
-                if abs(heading_error)>1.15:
-                    continue
-            t=max(0.0,min(1.0,((x-a['x'])*dx+(y-a['y'])*dy)/d2))
-            lateral=math.hypot(x-a['x']-t*dx,y-a['y']-t*dy)
-            arc=self.arc[i]+t*math.sqrt(d2)
-            if lateral<best_d:
-                best_d,best_s=lateral,arc
-        if best_s is None or best_d>self.local_reach(old):
+        # Project only onto a short contiguous local sequence, with heading
+        # checks for the next segments. This permits crossing a waypoint
+        # station with lateral error; it does not require hitting every
+        # recorded point's tiny circle. Never search across the whole loop.
+        if yaw is None:
+            a,b=self.points[old-1],self.points[old]
+            yaw=math.atan2(b['y']-a['y'],b['x']-a['x'])
+        best=local_station(self.points,old,x,y,yaw)
+        if best is None or best[2]>self.gate_reach(old):
             return False
+        best_s=self.arc[old-1]+best[3]
         # Advance one waypoint per valid pose, only after passing its local
         # along-route gate. It must not skip WP indices at a sharp corner.
         target_arc=self.arc[old]
@@ -176,10 +220,11 @@ class ProgressTracker(object):
         if best_s<target_arc-margin:
             return False
         self.next_index+=1
-        if self.next_index>=n:
-            if math.hypot(x-self.points[-1]['x'],y-self.points[-1]['y'])<=0.55:
-                self.next_index=0
-                self.completed=True
-            else:
-                self.next_index=n-1
-        return self.next_index!=old or self.completed
+        return self.next_index!=old
+
+    def acknowledge_goal(self):
+        """Latch completion in memory; disk may reset for the next explicit START."""
+        if self.completed or self.next_index != len(self.points)-1:
+            return False
+        self.completed = True
+        return True

@@ -29,7 +29,7 @@ HOME = os.path.expanduser('~')
 BUNDLE = os.path.dirname(os.path.abspath(__file__))
 SENSOR_TOPICS = ['/velodyne_points', '/hunter_status', '/odom', '/tf', '/tf_static', '/cmd_vel', '/points_raw', '/filtered_points', '/ndt_pose', '/ndt_stat', '/current_pose', '/hunter_nav/route', '/hunter_nav/safety_state', '/hunter_nav/applied_cmd', '/offline_nav/twist_cmd']
 HUNTER_SETUP = os.path.join(HOME, 'hunter_ws', 'devel', 'setup.bash')
-GUI_VERSION = '1.5.17'
+GUI_VERSION = '1.6.10'
 
 
 def ros_cmd(args, hunter=False):
@@ -225,6 +225,8 @@ class OnlineGUI(QMainWindow):
         self.setWindowTitle('HUNTER / AUTOWARE-LITE ONLINE — Phase 1+2')
         self.resize(1210, 850)
         self.proc = {}
+        self.hunter_protocol_model=None
+        self.hunter_protocol_tail=''
         self.settings = QSettings('NTUT-Robotics', 'HunterOnlinePhase12')
         self.pool = ThreadPoolExecutor(max_workers=3)
         self.pending = []
@@ -329,6 +331,13 @@ class OnlineGUI(QMainWindow):
                     self.log('{} 發生錯誤：{}'.format(label,e))
         for role, proc in list(self.proc.items()):
             for data in capture_stdout_lines(proc):
+                if role=='hunter':
+                    # Parse full driver stdout (including chunk boundaries)
+                    # without depending on the truncated GUI display.
+                    merged=self.hunter_protocol_tail+data
+                    matches=re.findall(r'Detected protocol:\s*AGX_V([12])',merged)
+                    if matches:self.hunter_protocol_model='hunter'+matches[-1]
+                    self.hunter_protocol_tail=merged[-96:]
                 lines=[ln for ln in data.replace('\r','\n').splitlines() if ln.strip()]
                 for ln in lines[:8]:
                     self.log('[{}] {}'.format(role,ln[:320]))
@@ -353,6 +362,9 @@ class OnlineGUI(QMainWindow):
                 stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True,bufsize=0)
             os.set_blocking(proc.stdout.fileno(),False)
             self.proc[role]=proc
+            if role=='hunter':
+                self.hunter_protocol_model=None
+                self.hunter_protocol_tail=''
             if stdin_data:
                 proc.stdin.write(stdin_data); proc.stdin.flush()
                 if role != 'motion': proc.stdin.close()
@@ -1119,9 +1131,11 @@ class OnlineGUIV13(OnlineGUI):
             self.log('請先載入 Waypoint。');return
         if self.is_running('nav_preview'):
             self.log('Pure Pursuit 預覽已在執行。');return
-        if not self.autoware_ready(['pure_pursuit','twist_filter']):return
+        direct=bool(getattr(self,'nav_loaded_path',None))
+        required=['twist_filter'] if direct else ['pure_pursuit','twist_filter']
+        if not self.autoware_ready(required):return
         launch=os.path.join(BUNDLE,'launch','online_pure_pursuit_preview.launch')
-        args=['roslaunch',launch]
+        args=['roslaunch',launch,'direct_ordered_pp:='+('true' if direct else 'false')]
         if hasattr(self,'nav_lookahead_ratio') and hasattr(self,'nav_min_lookahead'):
             ratio,minimum=self.pure_pursuit_follow_values()
             # Set ROS params at launch, then publish ConfigWaypointFollower
@@ -1132,6 +1146,7 @@ class OnlineGUIV13(OnlineGUI):
             if hasattr(self,'nav_lookahead_ratio') and hasattr(self,'nav_min_lookahead'):
                 self.nav_preview_follow_params=self.pure_pursuit_follow_values()
             self.nav_note.setText('預覽運作中：/offline_nav/twist_cmd；導航命令由 Supervisor 管理。')
+            if direct:self.log('Ordered PP：直接使用弧長預瞄點計算曲率；保留 Autoware twist_filter，避免舊 PP 重選目標後輸出零速度。')
             QTimer.singleShot(1500,self.publish_nav_config)
 
     def _start_nav_config_publisher(self,role,topic,typ,obj,attempt=0):
@@ -1319,6 +1334,9 @@ class OnlineGUIV15(OnlineGUIV13):
         args=['python2','-u',bridge,'--csv',self.nav_route_path]
         if hasattr(self,'nav_cruise_speed'):
             args+=['--cruise-mps',str(self.applied_nav_speed())]
+        if hasattr(self,'nav_lookahead_ratio'):
+            ratio,minimum=self.pure_pursuit_follow_values()
+            args+=['--lookahead-ratio',str(ratio),'--min-lookahead',str(minimum)]
         if self.start_proc('nav_bridge',args):
             self.nav_loaded_path=self.nav_route_path
             self.nav_loaded_cruise_mps=(self.nav_cruise_speed.value() if hasattr(self,'nav_cruise_speed') else None)
@@ -1389,6 +1407,9 @@ class OnlineGUIV15(OnlineGUIV13):
                 if not ok or typed!='HUNTER TEST':return
         supervisor=os.path.join(BUNDLE,'hunter_nav_supervisor.py')
         args=['python2','-u',supervisor,'--max-ndt-score',str(self.nav_ndt_score_limit.value())]
+        model=self.hunter_protocol_model or 'hunter1'
+        args+=['--hunter-model',model]
+        self.log('Hunter 導航幾何：{}（{}）'.format(model,'驅動自動偵測' if self.hunter_protocol_model else '本車 AGX_V1 預設'))
         if hasattr(self,'nav_cruise_speed'):
             args+=['--max-speed',str(self.applied_nav_speed())]
         if hasattr(self,'nav_vehicle_width'):
@@ -1400,6 +1421,14 @@ class OnlineGUIV15(OnlineGUIV13):
         if hasattr(self,'nav_obstacle_stop_distance'):
             args+=['--obstacle-stop-m',str(self.nav_obstacle_stop_distance.value())]
         args+=['--pose-timeout','1.0','--min-pose-hz','2.0']
+        if hasattr(self,'nav_lookahead_ratio'):
+            ratio,minimum=self.pure_pursuit_follow_values()
+            args+=['--lookahead-ratio',str(ratio),'--min-lookahead',str(minimum)]
+        if hasattr(self,'nav_recovery_enable') and self.nav_recovery_enable.isChecked():
+            args+=['--recovery-enable']
+            for key,widget in self.nav_recovery_fields.items():
+                args+=['--recovery-'+key,str(widget.value())]
+            self.log('Recovery：已啟用自動後退脫困（彎道障礙／車頭偏差／有效預瞄點失效）；後方障礙／未知格時自動停車等待。')
         if hardware:args.append('--hardware')
         if not self.start_proc('nav_supervisor',args,hunter=True):return
         script=os.path.join(BUNDLE,'hunter_nav_operator_gate.py')
@@ -1896,17 +1925,13 @@ class OnlineGUISimple(OnlineGUIV15):
         self.log('巡航目標：{:.2f}m/s（{:.1f}km/h）；實際速度將受定位品質、'
                  '前方可用煞車距離、彎道與加速斜率限制。'.format(
                   self.applied_nav_speed(),self.applied_nav_speed()*3.6))
-        if self.is_running('nav_bridge') and (
-                getattr(self,'nav_loaded_path',None)!=self.nav_route_path or
-                getattr(self,'nav_loaded_cruise_mps',None)!=self.nav_cruise_speed.value()):
-            self.log('路徑或巡航速度已變更，先停止舊預覽並重新載入。')
+        # Explicit START always reloads the stored index. This discards the
+        # previous bridge's in-memory completion latch without skipping resume
+        # checks; NDT/ROS/driver stay alive. No automatic new lap.
+        self.nav_reload_pending = self.is_running('nav_bridge') or self.is_running('nav_preview')
+        if self.nav_reload_pending:
+            self.log('重新載入 Waypoint 進度與 Pure Pursuit（保留 NDT／感測器）。')
             self.stop_nav_preview()
-        # If a preview was kept alive after a previous STOP, send changed
-        # lookahead values before re-arming. The user need not press Apply.
-        if self.is_running('nav_preview') and (
-                getattr(self,'nav_preview_follow_params',None)!=self.pure_pursuit_follow_values()):
-            self.log('已更新 Pure Pursuit 參數，重新發送追蹤設定。')
-            self.publish_nav_config()
         self.simple_request=True
         self.simple_arm_sent=False
         self.simple_request_t0=time.monotonic()
@@ -1936,6 +1961,11 @@ class OnlineGUISimple(OnlineGUIV15):
             self.log('導航準備取消：Hunter、VLP 或 NDT Matching 已停止。')
             self.simple_stop()
             return
+        if getattr(self,'nav_reload_pending',False):
+            if self.is_running('nav_bridge') or self.is_running('nav_preview'):
+                QTimer.singleShot(300,self._simple_continue)
+                return
+            self.nav_reload_pending=False
         if not self.is_running('nav_bridge'):
             self.load_waypoints()
         elif not self.is_running('nav_preview'):
@@ -1998,9 +2028,665 @@ class OnlineGUISimple(OnlineGUIV15):
         self.simple_stop()
         super().closeEvent(event)
 
+
+
+# v1.6.0: Live recording feasibility visualizer + self-contained CSV statuses.
+# This only augments the existing GUI workflow. The ROS preview process creates
+# no cmd_vel/CAN publisher, and uses the same pure evaluator as CSV export.
+import json as _json
+from nav_trajectory_feasibility import (profile_for as _profile_for,
+    profile_id as _profile_id, counts as _feasibility_counts)
+
+
+class OnlineGUIV160(OnlineGUISimple):
+    def __init__(self):
+        self.feasibility_state_path=None
+        self.feasibility_latest_file=None
+        self.feasibility_profile=None
+        self.feasibility_last_read=0.0
+        super().__init__()
+        self.setWindowTitle('HUNTER / AUTOWARE-LITE ONLINE — 線上軌跡可行性 v1.6.0')
+        self.log('v1.6.0：NDT 錄製時延遲預檢彩色軌跡；CSV 保存每段狀態，04 導航 RViz 重現。僅供研究預檢。')
+
+    def page_localization(self):
+        page=super().page_localization()
+        body=page.widget().layout()
+        group=self.group('錄製中導航可行性預檢（不控制 Hunter）')
+        self.feasibility_enabled=QCheckBox('開始錄製 NDT CSV 時同步啟用延遲預檢與 RViz 彩色軌跡')
+        self.feasibility_enabled.setChecked(True)
+        group.layout().addWidget(self.feasibility_enabled)
+        note=QLabel('綠=幾何預檢通過；黃=風險／無地圖驗證；紅=預檢未通過；灰=前方資料不足。\n'
+                    '採用 04 分頁現有 Lookahead、車寬、Half Width、偏離上限、停車距離及取樣間距。'
+                    '檢查結果依未來預瞄路段延遲更新。未執行認證級碰撞檢查。')
+        note.setWordWrap(True)
+        group.layout().addWidget(note)
+        self.feasibility_note=QLabel('尚未錄製；按「開始錄製 NDT CSV」後會同步啟動預檢。')
+        self.feasibility_note.setWordWrap(True)
+        group.layout().addWidget(self.feasibility_note)
+        # Keep the new control directly next to the existing trajectory recorder.
+        body.insertWidget(max(0,body.count()-1),group)
+        return page
+
+    def page_navigation(self):
+        page=super().page_navigation()
+        self.nav_spacing.setValue(float(self.settings.value('nav_trajectory_spacing_m',.25)))
+        self.nav_spacing.valueChanged.connect(
+            lambda value:self.settings.setValue('nav_trajectory_spacing_m',float(value)))
+        row=QHBoxLayout()
+        self.feasibility_view_csv_btn=QPushButton('只讀載入彩色 Waypoint CSV（不啟動車輛）')
+        self.feasibility_view_csv_btn.clicked.connect(self.preview_saved_waypoint_csv)
+        row.addWidget(self.feasibility_view_csv_btn)
+        page.widget().layout().insertLayout(12,row)
+        return page
+
+    def preview_saved_waypoint_csv(self):
+        if self.is_running('nav_supervisor') or getattr(self,'simple_request',False):
+            self.log('請先停止實車導航，再更換或預覽彩色 Waypoint。');return
+        if self.is_running('nav_bridge'):
+            if getattr(self,'nav_loaded_path',None)==self.vpath(self.nav_path):
+                self.open_nav_rviz()
+                return
+            self.log('已載入另一條路徑；請先停止原本的導航預覽，再載入新 CSV。')
+            return
+        if not self.validate_nav_csv():return
+        self.load_waypoints()
+        if self.is_running('nav_bridge'):
+            self.open_nav_rviz()
+
+    def _current_feasibility_profile(self):
+        width=self.nav_vehicle_width.value()
+        return _profile_for(
+            self.nav_lookahead_ratio.value(),self.nav_min_lookahead.value(),
+            width,self.nav_corridor_half_width.value(),
+            self.nav_cross_track_limit.value(),self.nav_obstacle_stop_distance.value(),
+            self.nav_cruise_speed.value(),spacing=self.nav_spacing.value())
+
+    def start_pose_capture(self):
+        if self.is_running('nav_supervisor') or getattr(self,'simple_request',False):
+            self.log('實車導航進行中不能同時錄製預檢；請先停止自主導航。')
+            return
+        super().start_pose_capture()
+        if not self.is_running('csv_pose') or not self.feasibility_enabled.isChecked():
+            return
+        try:
+            profile=self._current_feasibility_profile()
+        except (ValueError,TypeError) as exc:
+            self.log('軌跡預檢參數錯誤：'+str(exc));return
+        raw=getattr(self,'csv_raw_path','')
+        suffix=os.path.basename(raw).replace('_raw.csv','')
+        state=os.path.join('/tmp','hunter_feasibility_{}_{}.json'.format(suffix,os.getpid()))
+        self.feasibility_state_path=state
+        self.feasibility_profile=profile
+        self.feasibility_last_read=0.0
+        self.settings.setValue('nav_trajectory_spacing_m',profile['spacing_m'])
+        self.settings.setValue('feasibility_spacing_m',profile['spacing_m'])
+        # No motor control: this node only subscribes and publishes Markers/JSON.
+        script=os.path.join(BUNDLE,'nav_trajectory_preview_node.py')
+        if not self.start_proc('feasibility_preview',[
+                'python2','-u',script,'--profile-json',_json.dumps(profile),
+                '--state-file',state]):
+            self.log('預檢節點啟動失敗；原本 NDT CSV 錄製仍進行。')
+            return
+        self.feasibility_note.setText('預檢中：使用當次 GUI 參數；依預瞄距離延遲評估，灰色代表尚未完成驗證。')
+        self.log('線上預檢啟動：{}；Half Width={:.2f}m、Min Lookahead={:.2f}m、間距={:.2f}m。'.format(
+            _profile_id(profile),profile['corridor_half_width_m'],
+            profile['min_lookahead_m'],profile['spacing_m']))
+
+    def stop_pose_capture(self):
+        if self.is_running('feasibility_preview'):
+            self.stop('feasibility_preview')
+        super().stop_pose_capture()
+
+    def _csv_finish(self,text):
+        super()._csv_finish(text)
+        if not text.startswith('CSV 已整理'):
+            return
+        if self.feasibility_state_path:
+            QTimer.singleShot(500,lambda:self._finish_colored_csv(0))
+        else:
+            self.log('此次未啟用線上預檢；可在 04 用「產生 Waypoint CSV」執行離線預檢。')
+
+    def _finish_colored_csv(self,attempt):
+        path=self.feasibility_state_path
+        if not path:return
+        ready=False
+        try:
+            with open(path,encoding='utf-8') as f:
+                snap=_json.load(f)
+            ready=(snap.get('completed') is True and
+                   len(snap.get('segments',[]))==len(snap.get('samples',[])))
+        except (IOError,OSError,ValueError):pass
+        if not ready:
+            if attempt<35:
+                QTimer.singleShot(200,lambda:self._finish_colored_csv(attempt+1))
+            else:
+                self.log('線上預檢尚未完成快照：不會假造錄製時的顏色；已保留整理後 NDT CSV。')
+                self.feasibility_note.setText('未取得完整預檢快照，請先檢查 ROS 日誌。')
+            return
+        source=self.vpath(self.nav_csv)
+        target=source.replace('_pose.csv','_waypoints.csv')
+        if target==source:target=source+'.waypoints.csv'
+        profile=snap['profile']
+        cmd=['python3',os.path.join(BUNDLE,'generate_waypoints.py'),
+             '--input',source,'--output',target,
+             '--spacing-m',str(profile['spacing_m']),
+             '--speed-kmh',str(min(5.0,max(.10,profile['speed_mps']*3.6))),
+             '--state-json',path]
+        def finished(message):
+            if message.startswith('成功：'):
+                self.nav_path.setText(target)
+                self.feasibility_latest_file=target
+                self.save_live_settings()
+                self.feasibility_note.setText('已儲存彩色 Waypoint CSV：'+target)
+                self.log('03→04 同一份彩色路段資料：'+target)
+            else:
+                self.feasibility_note.setText('彩色 CSV 產生失敗：'+message[-250:])
+            self.log(message)
+        self.async_task('彩色 Waypoint CSV',lambda:self._run_waypoint_generator(cmd),finished)
+
+    def generate_nav_csv(self):
+        source,target=self.vpath(self.nav_csv),self.vpath(self.nav_path)
+        if not os.path.isfile(source):
+            self.log('找不到 NDT 整理後 CSV：'+source);return
+        profile=self._current_feasibility_profile()
+        script=os.path.join(BUNDLE,'generate_waypoints.py')
+        cmd=['python3',script,'--input',source,'--output',target,
+             '--spacing-m',str(self.nav_spacing.value()),
+             '--speed-kmh',str(self.nav_speed.value()),
+             '--profile-json',_json.dumps(profile)]
+        self.async_task('離線預檢 Waypoint CSV',lambda:self._run_waypoint_generator(cmd))
+
+    def validate_nav_csv(self):
+        ok=super().validate_nav_csv()
+        if not ok:return False
+        try:
+            data=load_route(self.vpath(self.nav_path))
+        except (IOError,OSError,ValueError):return ok
+        extras=[p.get('segment_status') for p in data if p.get('segment_status')]
+        if extras:
+            tally=dict((s,extras.count(s)) for s in ('PASS','WARN','FAIL','PENDING'))
+            ids=set(p.get('check_profile','') for p in data if p.get('check_profile'))
+            current=_profile_id(self._current_feasibility_profile())
+            stale=(len(ids)!=1 or current not in ids)
+            self.feasibility_route_has_fail=('FAIL' in extras)
+            self.feasibility_route_stale=stale
+            self.nav_note.setText(self.nav_note.text()+'\nCSV 預檢：'+str(tally)+
+                    ('；⚠ 檢查參數已改變，儲存顏色僅供參考' if stale else '；參數一致'))
+            self.log('CSV 路段預檢：{}；{}'.format(tally,'參數已變動需重檢' if stale else '參數一致'))
+        else:
+            self.feasibility_route_has_fail=False
+            self.feasibility_route_stale=False
+            self.log('傳統六欄 Waypoint CSV：未包含彩色預檢狀態。')
+        return ok
+
+    def simple_start(self):
+        if self.is_running('csv_pose') or self.is_running('feasibility_preview'):
+            self.log('錄製中的路線尚未完成預檢；請先停止錄製、檢查彩色 CSV，再開始導航。')
+            return
+        return super().simple_start()
+
+    def arm_nav(self,hardware):
+        if self.is_running('csv_pose') or self.is_running('feasibility_preview'):
+            self.log('錄製預檢未完成，實車導航不允許與錄製同時執行。')
+            return
+        # Fail-closed for NEW colored CSV known to have a failed segment or a
+        # stale parameter profile. Old 6-field CSV follows previous checks.
+        if hardware and self.validate_nav_csv():
+            if getattr(self,'feasibility_route_has_fail',False):
+                self.log('此 CSV 含預檢 FAIL 路段；請在 RViz 檢查並重新錄製，不啟動實車導航。')
+                return
+            if getattr(self,'feasibility_route_stale',False):
+                self.log('當前導航參數和 CSV 預檢設定不同；請重新產生可行性狀態後再行駛。')
+                return
+        return super().arm_nav(hardware)
+
+    def tick(self):
+        super().tick()
+        if not getattr(self,'feasibility_state_path',None):return
+        if not self.is_running('feasibility_preview'):return
+        if time.monotonic()-self.feasibility_last_read < 1.2:return
+        self.feasibility_last_read=time.monotonic()
+        try:
+            with open(self.feasibility_state_path,encoding='utf-8') as f:
+                data=_json.load(f)
+        except (IOError,OSError,ValueError):return
+        d=_feasibility_counts(data.get('segments',[]))
+        self.feasibility_note.setText('錄製中：{} 點｜綠 {} 黃 {} 紅 {} 灰 {}｜地圖={}。'
+            '注意前方 Lookahead 尚未錄到的路段會延遲更新。'.format(
+            len(data['samples']),d['PASS'],d['WARN'],d['FAIL'],d['PENDING'],
+            '有高度回波' if data['map_loaded'] else '未驗證'))
+
+    def stop_matching(self):
+        if self.is_running('feasibility_preview'):self.stop('feasibility_preview')
+        super().stop_matching()
+
+    def stop_all(self):
+        if self.is_running('feasibility_preview'):self.stop('feasibility_preview')
+        super().stop_all()
+
+    def closeEvent(self,event):
+        if self.is_running('feasibility_preview'):self.stop('feasibility_preview')
+        super().closeEvent(event)
+
+# v1.6.5: supervised VLP-16 recovery with no retry quota, backoff or reset timer.
+# No motor/CAN commands are emitted by this watchdog. During hardware navigation
+# a sensor loss requests navigation STOP and never auto-resumes navigation.
+class OnlineGUIV161(OnlineGUIV160):
+    def __init__(self):
+        self.lidar_watch_armed = False
+        self.lidar_monitor_file = '/tmp/hunter_lidar_health_{}.json'.format(os.getpid())
+        self.lidar_health_first_seen = False
+        self.lidar_started_wall = 0.0
+        self.lidar_started_monotonic = 0.0
+        self.lidar_last_watch_tick = 0.0
+        # Attempt counter is informational only; it does not gate retries.
+        self.lidar_recovery_attempts = 0
+        self.lidar_recovery_phase = None
+        self.lidar_recovery_started = 0.0
+        self.lidar_monitor_last_good = 0.0
+        self.lidar_good_since = None
+        self.lidar_recording_interrupted = False
+        self.lidar_recovery_internal_stop = False
+        self.lidar_sensor_healthy = False
+        self.lidar_monitor_notice = 0.0
+        self.lidar_active_port = 2368
+        super().__init__()
+        self.setWindowTitle('HUNTER / AUTOWARE-LITE ONLINE — VLP 自動恢復 v1.6.5')
+        self.log('v1.6.6：終點與減速依 Waypoint 順序／剩餘路徑長度，完成後需重新 Start。')
+        self.log('v1.6.5：VLP 失聯可持續重試，無次數上限、無指數退避、無 30 秒重設條件。')
+
+    def page_overview(self):
+        page = super().page_overview()
+        layout = page.widget().layout()
+        box = self.group('VLP-16 點雲健康監控／失聯恢復（僅重啟本 GUI 啟動的 Driver）')
+        self.lidar_auto_recover = QCheckBox('開啟自動恢復：點雲持續逾時才重啟 VLP Driver；不自動恢復導航')
+        enabled = str(self.settings.value('lidar_auto_recover_enabled','true')).lower() in ('1','true','yes')
+        self.lidar_auto_recover.setChecked(enabled)
+        self.lidar_auto_recover.toggled.connect(self._lidar_auto_toggle)
+        box.layout().addWidget(self.lidar_auto_recover)
+        row = QHBoxLayout()
+        row.addWidget(QLabel('點雲連續無更新門檻（秒）'))
+        self.lidar_stall_seconds = QSpinBox()
+        self.lidar_stall_seconds.setRange(3,15)
+        self.lidar_stall_seconds.setValue(int(self.settings.value('lidar_stall_seconds',5)))
+        self.lidar_stall_seconds.valueChanged.connect(lambda v:self.settings.setValue('lidar_stall_seconds',v))
+        row.addWidget(self.lidar_stall_seconds)
+        row.addStretch()
+        box.layout().addLayout(row)
+        self.lidar_watch_status = QLabel('未啟動監控；請在 00 頁啟動 VLP-16 Driver。')
+        self.lidar_watch_status.setWordWrap(True)
+        box.layout().addWidget(self.lidar_watch_status)
+        helptext = QLabel('VLP 自動恢復無重啟次數上限、無遞增等待、無穩定 30 秒重設條件。'
+            '只要舊 Driver 已退出、ROS Master 可用且導航/運動已安全停止，就直接重啟。'
+            '若上述必要條件暫時不成立，監控會持續等待並自動再試，不永久停用。'
+            '錄製／建圖中斷會停止當次作業；導航絕不自動恢復行駛。')
+        helptext.setWordWrap(True)
+        box.layout().addWidget(helptext)
+        layout.insertWidget(max(0,layout.count()-1),box)
+        return page
+
+    def _lidar_auto_toggle(self, enabled):
+        self.settings.setValue('lidar_auto_recover_enabled',bool(enabled))
+        if not enabled:
+            self.lidar_recovery_phase = None
+            if self.is_running('lidar_health'): super().stop('lidar_health')
+            self.lidar_watch_status.setText('自動恢復已關閉；LiDAR Driver 不受影響。')
+        elif self.is_running('lidar'):
+            self._ensure_lidar_monitor()
+
+    def _ensure_lidar_monitor(self):
+        if not self.lidar_auto_recover.isChecked(): return
+        if not self.is_running('lidar'): return
+        if self.is_running('lidar_health'): return
+        try:
+            if os.path.exists(self.lidar_monitor_file):os.unlink(self.lidar_monitor_file)
+        except OSError:pass
+        self.start_proc('lidar_health',['python2','-u',
+            os.path.join(BUNDLE,'lidar_health_monitor.py'),
+            '--state-file',self.lidar_monitor_file])
+
+    def start_proc(self,role,args,ros=True,hunter=False,stdin_data=None):
+        ok=super().start_proc(role,args,ros=ros,hunter=hunter,stdin_data=stdin_data)
+        if ok and role=='lidar':
+            for arg in args:
+                if str(arg).startswith('port:='):
+                    try:self.lidar_active_port=int(str(arg).split(':=',1)[1])
+                    except (ValueError,TypeError):pass
+            self.lidar_watch_armed=True
+            self.lidar_started_wall=time.time()
+            self.lidar_started_monotonic=time.monotonic()
+            self.lidar_health_first_seen=False
+            self.lidar_good_since=None
+            self.lidar_sensor_healthy=False
+            self.lidar_monitor_last_good=0.0
+            self._ensure_lidar_monitor()
+        return ok
+
+    def stop(self,role):
+        if role=='lidar' and not self.lidar_recovery_internal_stop:
+            # Operator intentionally stopped the driver: never auto restart.
+            self.lidar_watch_armed=False
+            self.lidar_recovery_phase=None
+            if self.is_running('lidar_health'):super().stop('lidar_health')
+            self.lidar_watch_status.setText('已由操作員停止 LiDAR；不會自動重啟。')
+        return super().stop(role)
+
+    def _lidar_nav_busy(self):
+        return (getattr(self,'simple_request',False) or
+                any(self.is_running(x) for x in ('nav_gate','nav_supervisor','motion','zero','mapping')))
+
+    def _lidar_begin_recovery(self,reason):
+        if self.lidar_recovery_phase is not None:return
+        now=time.monotonic()
+        if self._lidar_nav_busy():
+            self.log('VLP 點雲逾時：先要求停止實車導航/運動，禁止自動恢復導航。')
+            self.simple_stop()
+            if self.is_running('motion'):self.stop('motion')
+        if self.is_running('mapping'):
+            self.log('VLP 點雲中斷：已要求停止正在執行的 NDT 建圖，以免持續累積不完整地圖。')
+            self.stop_mapping()
+        if self.is_running('csv_pose'):
+            self.lidar_recording_interrupted=True
+            # Never generate an apparently clean colored waypoint route from
+            # a recorded pose segment containing a LiDAR dropout.
+            self.feasibility_state_path=None
+            self.log('VLP 點雲逾時：已要求停止 NDT CSV 錄製；本次資料不得直接用於導航。')
+            self.stop_pose_capture()
+        self.lidar_sensor_healthy=False
+        self.lidar_recovery_phase='wait_safe_stop'
+        self.lidar_recovery_started=now
+        self.lidar_watch_status.setText('光達失聯：等待導航/測試命令停止，再恢復 VLP 驅動。')
+        self.log('VLP AUTO-RECOVERY: {}。僅重啟 LiDAR Driver，不關閉地圖/NDT/RViz。'.format(reason))
+
+    def _lidar_progress_recovery(self):
+        """Keep retrying without a time/quota backoff, but never duplicate a Driver.
+
+        The 1 Hz GUI health tick is a polling cadence, NOT an imposed restart
+        cooldown. A restart is eligible immediately after the previous owned
+        driver has exited and hardware-navigation is no longer active.
+        """
+        phase=self.lidar_recovery_phase
+        if phase is None:return
+        now=time.monotonic()
+        if phase=='wait_safe_stop':
+            if self._lidar_nav_busy():
+                if now-self.lidar_recovery_started>=12.0 and now-self.lidar_monitor_notice>=12.0:
+                    self.lidar_monitor_notice=now
+                    self.log('VLP AUTO-RECOVERY: 仍在等待導航/運動安全停止；監控未停用，將持續確認。')
+                return
+            self.lidar_recovery_attempts+=1
+            self.log('VLP AUTO-RECOVERY: 第 {} 次重啟嘗試（無次數上限及遞增等待）。'.format(
+                self.lidar_recovery_attempts))
+            if self.is_running('lidar'):
+                self.lidar_recovery_internal_stop=True
+                try:self.stop('lidar')
+                finally:self.lidar_recovery_internal_stop=False
+            self.lidar_recovery_phase='stopping'
+            self.lidar_recovery_started=now
+            return
+        if phase=='stopping':
+            if self.is_running('lidar'):
+                # Never start another UDP 2368 receiver over an owned process.
+                # Unlike v1.6.4, do not disarm the watchdog at an arbitrary
+                # 9-second limit; wait for the old process to actually exit.
+                if now-self.lidar_recovery_started>=9.0 and now-self.lidar_monitor_notice>=9.0:
+                    self.lidar_monitor_notice=now
+                    self.log('VLP AUTO-RECOVERY: 舊 Driver 尚未退出；持續等待，避免雙重綁定 UDP。')
+                return
+            self.lidar_recovery_phase='restart_ready'
+            self.log('VLP AUTO-RECOVERY: 舊 Driver 已退出；直接準備重啟，不額外延遲。')
+            phase='restart_ready'
+        if phase=='restart_ready':
+            if self._lidar_nav_busy():
+                # Never restart a sensor while motion-control processes remain
+                # active. Continue checking on the next GUI tick.
+                return
+            if not master_ok():
+                if now-self.lidar_monitor_notice>=10.0:
+                    self.lidar_monitor_notice=now
+                    self.log('VLP AUTO-RECOVERY: ROS Master 暫時不可用；持續等待連線恢復，不停用監控。')
+                return
+            if self.is_running('lidar'):
+                # The operator or another code path started the owned Driver.
+                # Do not launch a duplicate instance; inspect its fresh data.
+                self.lidar_recovery_phase='restarting'
+                self.lidar_recovery_started=now
+                return
+            args=['roslaunch','velodyne_pointcloud','VLP16_points.launch',
+                  'device_ip:=','port:={}'.format(self.lidar_active_port)]
+            self.lidar_recovery_phase='restarting'
+            self.lidar_recovery_started=now
+            if not self.start_proc('lidar',args):
+                # The GUI will try again on its next health tick. No backoff,
+                # no attempt ceiling, no need to wait for 30 healthy seconds.
+                self.lidar_recovery_phase='restart_ready'
+                self.log('VLP AUTO-RECOVERY: Driver 啟動失敗；持續重試。')
+                return
+            self.log('VLP AUTO-RECOVERY: 已重新啟動 LiDAR Driver；等待新點雲。')
+            return
+        if phase=='restarting':
+            if self.lidar_sensor_healthy and self.lidar_good_since is not None and now-self.lidar_good_since>2.5:
+                self.lidar_recovery_phase=None
+                self.lidar_watch_status.setText('點雲恢復正常。注意：NDT 仍需重新確認定位，導航不會自動繼續。')
+                self.log('VLP AUTO-RECOVERY: /velodyne_points 已持續恢復。請重新檢查 NDT/錄製。')
+            elif not self.is_running('lidar'):
+                self.lidar_recovery_phase=None
+                self._lidar_begin_recovery('新 Driver 程序已結束，直接再次嘗試恢復')
+            elif now-self.lidar_recovery_started>20:
+                # This is a detection timeout for a *failed* start, not a
+                # wait imposed between attempts. Immediately start recovery.
+                self.lidar_recovery_phase=None
+                self._lidar_begin_recovery('重啟後仍未收到穩定點雲')
+
+    def _lidar_check_health(self):
+        now=time.monotonic()
+        if now-self.lidar_last_watch_tick<1.0:return
+        self.lidar_last_watch_tick=now
+        if not self.lidar_auto_recover.isChecked() or not self.lidar_watch_armed:return
+        if self.lidar_recovery_phase in ('wait_safe_stop','stopping','restart_ready'):
+            self._lidar_progress_recovery()
+            return
+        self._ensure_lidar_monitor()
+        if not self.is_running('lidar') and self.lidar_recovery_phase is None:
+            self._lidar_begin_recovery('LiDAR Driver 程序已結束')
+            return
+        try:
+            with open(self.lidar_monitor_file,encoding='utf-8') as stream:health=_json.load(stream)
+        except (IOError,OSError,ValueError):
+            health={}
+        update_age=time.time()-float(health.get('updated_wall',0.0))
+        last_wall=float(health.get('last_points_wall',0.0))
+        age=time.time()-last_wall if last_wall>0 else None
+        fresh_monitor=abs(update_age)<3.0
+        has_new_data=(last_wall>=self.lidar_started_wall and int(health.get('count',0))>0)
+        healthy=(fresh_monitor and has_new_data and age is not None and
+                 age<min(2.5,float(self.lidar_stall_seconds.value())))
+        self.lidar_sensor_healthy=bool(healthy)
+        if healthy:
+            self.lidar_health_first_seen=True
+            if self.lidar_good_since is None:self.lidar_good_since=now
+            self.lidar_monitor_last_good=now
+            self.lidar_watch_status.setText('VLP 正常：/velodyne_points 最新訊息距今 {:.1f} 秒；自動恢復已待命。'.format(age))
+        else:
+            self.lidar_good_since=None
+            if fresh_monitor:
+                display='無新點雲' if age is None else '最近點雲已 {:.1f} 秒'.format(max(0.0,age))
+                self.lidar_watch_status.setText('VLP 資料等待中：{}（觸發門檻 {} 秒）'.format(display,self.lidar_stall_seconds.value()))
+            else:
+                self.lidar_watch_status.setText('健康監控程序尚未準備／停止回報；不依過期狀態重啟 LiDAR。')
+        if self.lidar_recovery_phase=='restarting':
+            self._lidar_progress_recovery()
+            return
+        if not fresh_monitor:
+            if now-self.lidar_started_monotonic>18.0 and now-self.lidar_monitor_notice>15:
+                self.lidar_monitor_notice=now
+                self.log('VLP 健康監控沒有新回報；請檢查 Python2/ROS Topic。未依不可信狀態重啟。')
+            return
+        timeout=float(self.lidar_stall_seconds.value())
+        if self.lidar_health_first_seen and age is not None and age>=timeout:
+            self._lidar_begin_recovery('/velodyne_points 已 {:.1f} 秒未更新'.format(age))
+        elif not self.lidar_health_first_seen and now-self.lidar_started_monotonic>18.0:
+            self._lidar_begin_recovery('啟動超過 18 秒仍無第一筆點雲')
+
+    def start_pose_capture(self):
+        if self.lidar_auto_recover.isChecked() and self.lidar_watch_armed and not self.lidar_sensor_healthy:
+            self.log('目前無法確認新鮮 VLP 點雲，先確認 LiDAR 已恢復再開始 NDT CSV 錄製。')
+            return
+        self.lidar_recording_interrupted=False
+        return super().start_pose_capture()
+
+    def simple_start(self):
+        if self.lidar_auto_recover.isChecked() and self.lidar_watch_armed and not self.lidar_sensor_healthy:
+            self.log('VLP 健康檢查未通過，禁止開始實車自主導航。')
+            return
+        return super().simple_start()
+
+    def tick(self):
+        super().tick()
+        self._lidar_check_health()
+
+    def stop_all(self):
+        self.lidar_watch_armed=False
+        self.lidar_recovery_phase=None
+        if self.is_running('lidar_health'):super().stop('lidar_health')
+        super().stop_all()
+
+    def closeEvent(self,event):
+        self.lidar_watch_armed=False
+        self.lidar_recovery_phase=None
+        if self.is_running('lidar_health'):super().stop('lidar_health')
+        return super().closeEvent(event)
+
+# v1.6.3: remove all fixed/min-turn-radius preview settings. The precheck
+# now estimates Pure Pursuit tracking using the configured lookahead/speed,
+# and displays potential tracking failure vs route safety/clearance warnings.
+# Existing Supervisor angular-rate, lateral acceleration and STOP protections
+# remain separate and unchanged. No new motor/CAN publisher is introduced.
+class OnlineGUIV164(OnlineGUIV161):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('HUNTER / AUTOWARE-LITE ONLINE — Pure Pursuit + Recovery v1.6.10')
+        self.log('v1.6.10：彎道以局部路段投影更新 Waypoint 進度；依實際 AGX 協定套用底盤參數，新增預瞄點落後時的倒車脫困。')
+        self.log('v1.6.9：修正弧長裁切與 Autoware PP 最小直線距離的衝突，不再因預瞄路徑被裁短而間歇發零速。')
+        self.log('v1.6.8：配合實際 hunter_ws 的 yaw-rate 介面，依序弧長預瞄；前方受阻或彎道車頭偏差過大時自動倒車脫困。')
+        self.log('v1.6.6：終點與減速依 Waypoint 順序／剩餘路徑長度，完成後需重新 Start。')
+        self.log('v1.6.5：VLP 無次數限制、無 3～60 秒退避、無穩定 30 秒計數重設；只確認重啟必要條件。')
+        self.log('v1.6.3：取消固定迴轉半徑的預檢紅黃燈。'
+                 '以 Pure Pursuit Lookahead / 速度的預測追蹤偏差與進度顯示路段狀態；'
+                 '實車角速度、側向加速度、障礙、定位及停車保護不變。')
+
+    def page_navigation(self):
+        page=super().page_navigation()
+        layout=page.widget().layout()
+        note=QLabel('預檢核心：Pure Pursuit 在目前 Lookahead 與速度下是否能跟隨路徑；實際控制使用依序弧長預瞄，避免跨越閉合路線。'
+                    '不再以任意轉彎半徑將實際遙控錄製路線標成 FAIL／WARN。'
+                    '綠色僅為簡化運動學預測，仍需檢查地圖回波與實際車體掃掠。')
+        note.setWordWrap(True)
+        layout.insertWidget(13,note)
+        action=QHBoxLayout()
+        self.nav_recheck_feasibility=QPushButton('使用 Pure Pursuit 參數重新預檢 CSV（保留原檔／只讀）')
+        self.nav_recheck_feasibility.clicked.connect(self.recheck_saved_feasibility)
+        action.addWidget(self.nav_recheck_feasibility)
+        layout.insertLayout(14,action)
+        recovery=QGroupBox('Recovery Planner｜彎道受阻／車頭偏差脫困（實驗功能）')
+        rec=QVBoxLayout(); recovery.setLayout(rec)
+        self.nav_recovery_enable=QCheckBox('啟用自動倒車脫困（後方受阻時自動等待）')
+        self.nav_recovery_enable.setChecked(self.settings.value('nav_recovery_enabled',True,type=bool))
+        self.nav_recovery_enable.toggled.connect(lambda value:self.settings.setValue('nav_recovery_enabled',value))
+        rec.addWidget(self.nav_recovery_enable)
+        form=QGridLayout()
+        self.nav_recovery_fields={}
+        fields=[
+            ('front','base_link 到車頭 (m)',.20,2.,.70,'實測，預設值不是 Hunter 規格'),
+            ('rear','base_link 到車尾 (m)',.20,2.,.50,'實測，包含外掛設備'),
+            ('axle','base_link 在後軸前方 (m)',0.,2.,.35,'base_link 至後軸中心的前向偏移，需實測'),
+            ('radius','後軸最小轉彎半徑 (m)',.50,5.,1.50,'以實測倒車轉向能力為準，不是原本 CSV 預檢限制'),
+            ('distance','單次最大後退 (m)',.20,.80,.50,'限制單次脫困距離'),
+            ('speed','最大後退速度 (m/s)',.05,.15,.10,'限制上限，實際速度受 NDT 與剩餘距離進一步限制'),
+            ('margin','車身全周安全緩衝 (m)',.20,.60,.30,'包含車尾、車頭、兩側；不是安全認證'),
+            ('attempts','每次受阻最多嘗試',1,3,2,'達上限停車；正常跟隨通過後續兩點才重設')]
+        for i,(key,label,lo,hi,default,tip) in enumerate(fields):
+            widget=QSpinBox() if key=='attempts' else QDoubleSpinBox()
+            widget.setRange(lo,hi)
+            if key!='attempts':widget.setDecimals(2);widget.setSingleStep(.05)
+            try:
+                saved=(int if key=='attempts' else float)(self.settings.value('nav_recovery_'+key,default))
+            except (ValueError,TypeError):saved=default
+            widget.setValue(saved)
+            widget.valueChanged.connect(lambda v,k=key:self.settings.setValue('nav_recovery_'+k,v))
+            widget.setToolTip(tip);self.nav_recovery_fields[key]=widget
+            form.addWidget(QLabel(label),i//2,(i%2)*2)
+            form.addWidget(widget,i//2,(i%2)*2+1)
+        rec.addLayout(form)
+        warning=QLabel('尺寸／半徑為待量測暫填值。僅隔離場地靜態障礙測試；無點雲、未知格、TF／NDT／心跳不符即禁止倒車。'
+                       'RViz：青色=選定，綠色=可行，紅色=拒絕。脫困時凍結原 Waypoint，不會跳點。')
+        warning.setWordWrap(True);rec.addWidget(warning)
+        self.nav_recovery_enable.toggled.connect(self._recovery_controls_changed)
+        self._recovery_controls_changed()
+        layout.insertWidget(15,recovery)
+        return page
+
+    def _recovery_controls_changed(self,*args):
+        locked=getattr(self,'simple_request',False) or self.is_running('nav_supervisor')
+        enabled=self.nav_recovery_enable.isChecked()
+        self.nav_recovery_enable.setEnabled(not locked)
+        for widget in self.nav_recovery_fields.values():widget.setEnabled(enabled and not locked)
+
+    def simple_start(self):
+        if self.nav_recovery_enable.isChecked():
+            from nav_recovery_planner import RecoveryConfig
+            f=self.nav_recovery_fields
+            try:
+                RecoveryConfig(self.nav_vehicle_width.value(),f['front'].value(),f['rear'].value(),
+                    f['axle'].value(),f['radius'].value(),f['distance'].value(),f['speed'].value(),
+                    f['attempts'].value(),f['margin'].value())
+            except ValueError as exc:
+                self.log('Recovery 設定不合法：'+str(exc));return
+        result=super().simple_start()
+        self._recovery_controls_changed()
+        return result
+
+    def tick(self):
+        super().tick()
+        if hasattr(self,'nav_recovery_enable'):
+            self._recovery_controls_changed()
+
+    def recheck_saved_feasibility(self):
+        if (self.is_running('nav_supervisor') or self.is_running('nav_bridge') or
+            getattr(self,'simple_request',False) or self.is_running('csv_pose') or
+            self.is_running('feasibility_preview')):
+            self.log('請先停止導航、路線預覽及錄製，再重新預檢 CSV。');return
+        source=self.vpath(self.nav_path)
+        if not os.path.isfile(source):
+            self.log('找不到 Waypoint CSV：'+source);return
+        try:
+            profile=self._current_feasibility_profile()
+        except (TypeError,ValueError) as exc:
+            self.log('預檢設定錯誤：'+str(exc));return
+        script=os.path.join(BUNDLE,'recheck_waypoint_feasibility.py')
+        required=(script,os.path.join(BUNDLE,'nav_trajectory_feasibility.py'),
+                  os.path.join(BUNDLE,'route_safety.py'))
+        missing=[os.path.basename(p) for p in required if not os.path.isfile(p)]
+        if missing:
+            self.log('重新預檢無法執行：GUI 安裝目錄缺少 {}；請安裝完整 v1.6.4 更新包。'.format(
+                ', '.join(missing)))
+            return
+        cmd=['python3',script,'--input',source,'--profile-json',_json.dumps(profile)]
+        def finished(message):
+            self.log(message)
+            if message.startswith('成功：'):
+                import re
+                found=re.search(r'NEW_CSV=(\S+)',message)
+                if found:
+                    self.nav_path.setText(found.group(1))
+                    self.save_live_settings()
+                self.log('新檔已產生；如 RViz 仍載入舊線，停止預覽後再按「只讀載入彩色 Waypoint CSV」。')
+        self.async_task('Pure Pursuit CSV 重新預檢',lambda:self._run_waypoint_generator(cmd),finished)
+
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    gui = OnlineGUISimple()
+    gui = OnlineGUIV164()
     gui.show()
     sys.exit(app.exec_())

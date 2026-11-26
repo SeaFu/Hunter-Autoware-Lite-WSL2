@@ -24,10 +24,15 @@ from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import Bool, String, Int32
 from hunter_msgs.msg import HunterStatus
 from autoware_msgs.msg import NDTStat
-from route_safety import validate, nearest_route_distance, nearest_route_heading, starting_alignment, wrap
-from nav_waypoint_progress import distance_to_remaining
+from route_safety import validate, nearest_route_distance, starting_alignment, wrap
+from nav_waypoint_progress import (distance_to_remaining, remaining_path_length,
+                                   final_waypoint_reached)
 from nav_route_corridor import route_to_base, in_corridor, corridor_edges, classify_point_region
 from nav_motion_policy import PoseRateWindow, adaptive_speed_cap, ClearanceGate, required_clearance, forward_speed_cap
+from nav_hunter_steering import HunterSteering
+from nav_ordered_lookahead import ordered_pursuit
+from nav_recovery_planner import (RecoveryConfig, RayGrid, arc, relative, transform,
+                                  local_route, local_projection, plan_reverse, turn_ahead)
 
 
 def yaw_of_quat(q):
@@ -40,8 +45,13 @@ def valid_number(x):
 
 class Supervisor(object):
     RATE = 20.0
-    def __init__(self, hardware=False, max_ndt_score=2.0, max_speed=0.10, pose_timeout=1.0, min_pose_hz=2.0, vehicle_width_m=0.80, max_cross_track_m=1.00, obstacle_stop_m=2.40, corridor_half_width_m=None):
+    def __init__(self, hardware=False, max_ndt_score=2.0, max_speed=0.10, pose_timeout=1.0, min_pose_hz=2.0, vehicle_width_m=0.80, max_cross_track_m=1.00, obstacle_stop_m=2.40, corridor_half_width_m=None, recovery_config=None, steering=None):
         self.hardware=hardware
+        self.steering=steering if steering is not None else HunterSteering('hunter1')
+        self.last_steer_feedback=None
+        self.last_steer_cmd=0.
+        self.recovery_tracking_blocked=False
+        self.recovery_trigger=None
         self.max_ndt_score=max_ndt_score
         self.max_speed=float(max_speed)
         self.pose_timeout=float(pose_timeout)
@@ -58,6 +68,7 @@ class Supervisor(object):
         self.pose=None;self.cmd=None;self.status=None;self.route=None;self.ndt_stat=None
         self.route_info=None
         self.progress_index=0
+        self.progress_received=False
         self.manual_since=None
         self.auto_since=None
         self.hold=False
@@ -85,6 +96,34 @@ class Supervisor(object):
         self.obstacle_horizon_m=min(35.0,max(2.4,self.obstacle_stop_m+1.0,
                                              required_clearance(self.max_speed)+1.0))
         self.nearest_obstacle_m=None
+        self.recovery_config=recovery_config
+        if recovery_config is not None:
+            recovery_config.radius=max(recovery_config.radius,self.steering.min_radius)
+            recovery_config.forward_curvature=self.steering.max_curvature
+        self.recovery_plan_scan_stamp=None
+        self.recovery_pending_scan=False
+        self.recovery_clear_gate=ClearanceGate(clear_dwell_s=1.0,min_clear_frames=4)
+        self.recovery_clear_stamp=None
+        self.recovery_blocked=False
+        self.recovery_grid=None
+        self.recovery_grid_stamp=None
+        self.recovery_grid_pose=None
+        self.recovery_sensor_stamp=None
+        self.recovery_obstacle=False
+        self.recovery_phase='IDLE'
+        self.recovery_wait_since=None
+        self.recovery_stationary_since=None
+        self.recovery_last_plan=0.
+        self.recovery_attempts=0
+        self.recovery_reset_index=None
+        self.recovery_plan=None
+        self.recovery_origin=None
+        self.recovery_index=None
+        self.recovery_started_at=None
+        self.recovery_motion_time=0.
+        self.recovery_travel=0.
+        self.recovery_stop_since=None
+        self.recovery_marker_pub=rospy.Publisher('/hunter_nav/recovery_markers',MarkerArray,queue_size=1,latch=True)
         # User-requested extra lateral allowance is 15cm PER OUTER SIDE,
         # not a +/-15cm strip around the centerline (which would put vehicle
         # parts outside the VLP-16 obstacle ROI). Actual widest vehicle / tool
@@ -166,7 +205,7 @@ class Supervisor(object):
                 expected_v=max(abs(self.last_odom_speed),abs(self.last_pub_v))
                 allowable_jump=max(0.6,expected_v*max(0.0,dt)*1.8+0.35)
                 if 0<dt<0.6 and displacement>allowable_jump:
-                    if self.started:
+                    if self.started or getattr(self,'recovery_phase','IDLE') in ('REVERSING','SETTLING'):
                         # A moving vehicle must stop immediately on an XY pose jump.
                         self.fault_latched='NDT XY 位姿不合理跳點（{:.2f}m / 門檻 {:.2f}m）；停車確認定位'.format(displacement,allowable_jump)
                     else:
@@ -180,26 +219,8 @@ class Supervisor(object):
             self.pose=msg
             self.arrived('pose')
             self.pose_rate.feed(time.time())
-            # After reaching the goal, the operator may take manual control,
-            # return to the ORIGINAL start, and select AUTO for a new lap.
-            # The completed lap can only be re-armed while in MANUAL, nearly
-            # stationary, correctly oriented and with the GUI START heartbeat
-            # still active. All regular checks apply again on return to AUTO.
-            if (self.complete and self.route_info is not None and
-                    self.status is not None and self.status.control_mode != 1 and
-                    abs(self.last_odom_speed) < 0.05 and self.hold):
-                aligned, _ = starting_alignment(
-                    self.route_info, msg.pose.position.x, msg.pose.position.y,
-                    yaw_of_quat(msg.pose.orientation))
-                if aligned:
-                    self.complete=False
-                    self.ever_started=False
-                    self.started=False
-                    self.progress_index=0
-                    self.pose_stable_since=time.time()
-                    self.manual_since=time.time()
-                    self.auto_since=None
-                    self.pub_state('WAIT: 已回到起點，等待切回 AUTO 並重新確認定位／路徑')
+            # GOAL stays latched until an explicit GUI STOP/START. Merely
+            # revisiting the start or toggling AUTO cannot authorize a new lap.
 
     def on_ndt_stat(self,msg):
         with self.lock:
@@ -218,6 +239,13 @@ class Supervisor(object):
         with self.lock:
             self.status=msg
             self.last_odom_speed=msg.linear_velocity
+            angle=getattr(msg,'steering_angle',None)
+            # The supplied AGX_V1 parser never initializes motion_state's
+            # steering_angle field (it only decodes angular_velocity).
+            # Do not report the resulting arbitrary converted value as real.
+            model=getattr(getattr(self,'steering',None),'model',None)
+            self.last_steer_feedback=(angle if model=='hunter2' and angle is not None
+                and valid_number(angle) and abs(angle)<=self.steering.max_angle+.10 else None)
             self.arrived('status')
 
     def on_route(self,msg):
@@ -225,7 +253,7 @@ class Supervisor(object):
             if msg.header.frame_id.lstrip('/')!='map':
                 self.fault_latched='導航路徑不是 map 座標'
                 return
-            if self.started: return  # never switch paths while moving
+            if self.route is not None: return  # one immutable route per supervisor run
             points=[]
             for i,p in enumerate(msg.poses):
                 x=p.pose.position
@@ -243,10 +271,19 @@ class Supervisor(object):
     def on_progress(self, msg):
         with self.lock:
             idx = int(msg.data)
-            if self.route is not None and 0 <= idx < len(self.route):
-                # Only use this progress index with the loaded route. It is a
-                # monotonic next-waypoint index from the CSV bridge.
+            if self.route is not None and 0 <= idx <= len(self.route):
+                if (getattr(self,'recovery_phase','IDLE') in ('REVERSING','SETTLING') and
+                        idx!=self.recovery_index):
+                    self.fault_latched='脫困期間 Waypoint 進度改變；停止並人工檢查'
+                    return
+                # N is the completed-run sentinel, not a new WP01.
+                # Never rewind progress inside the same supervisor session.
+                if self.progress_received and idx < self.progress_index:
+                    self.fault_latched='Waypoint 進度倒退；請停止後重新啟動導航'
+                    return
                 self.progress_index = idx
+                self.progress_received=True
+                self.arrived('progress')
 
     def on_hold(self,msg):
         with self.lock:
@@ -271,6 +308,7 @@ class Supervisor(object):
             with self.lock:
                 self.obstacle_ok=self.clearance.update(False,time.time())
                 self.obstacle_reason='LiDAR frame_id 空白'
+                self.recovery_grid=None; self.recovery_obstacle=False
             return
         try:
             (trans,quat)=self.listener.lookupTransform('base_link',frame,rospy.Time(0))
@@ -287,6 +325,9 @@ class Supervisor(object):
                 route_snapshot=self.route
                 progress_snapshot=self.progress_index
                 pose_snapshot=self.pose
+                need_recovery=(self.recovery_config is not None and
+                    (self.recovery_obstacle or self.recovery_tracking_blocked or
+                     self.recovery_phase in ('REVERSING','SETTLING')))
             corridor_path=None
             if route_snapshot is not None and pose_snapshot is not None:
                 p=pose_snapshot.pose.position
@@ -296,13 +337,19 @@ class Supervisor(object):
             # Safety fallback: if route geometry is unavailable, use the old
             # conservative rectangular region. Never silently declare CLEAR.
             corridor_ready=corridor_path is not None
+            # Recovery uses every height-valid return before the existing
+            # forward-only sampling/filter; bounded grid deduplicates cells.
+            recovery_points=[] if need_recovery else None
             for i,point in enumerate(point_cloud2.read_points(msg,field_names=('x','y','z'),skip_nans=True)):
-                if i % 6:
+                if i % 6 and recovery_points is None:
                     continue
                 x,y,z=point
                 bx=r11*x+r12*y+r13*z+trans[0]
                 by=r21*x+r22*y+r23*z+trans[1]
                 bz=r31*x+r32*y+r33*z+trans[2]
+                if recovery_points is not None and .05<=bz<=1.65 and abs(bx)<=12. and abs(by)<=12.:
+                    recovery_points.append((bx,by,bz))
+                if i % 6:continue
                 checked+=1
                 if not (0.50<bx<self.obstacle_horizon_m and 0.10<bz<1.65):
                     continue
@@ -476,8 +523,27 @@ class Supervisor(object):
                 side_label.text='SIDE / likely wall (outside planned ROI)'
                 marker_array.markers.append(side_label)
             self.obstacle_marker_pub.publish(marker_array)
+            grid=None; grid_pose=None; sensor_stamp=None
+            if recovery_points is not None and pose_snapshot is not None and checked>=100:
+                sensor_stamp=msg.header.stamp.to_sec()
+                sensor_age=rospy.Time.now().to_sec()-sensor_stamp
+                pose_stamp=pose_snapshot.header.stamp.to_sec()
+                # Do not reuse an old scan or combine with a remote NDT pose.
+                if sensor_stamp>0 and -0.10<=sensor_age<=.55 and abs(sensor_stamp-pose_stamp)<=.30:
+                    grid=RayGrid(recovery_points,trans,self.recovery_config)
+                    p=pose_snapshot.pose.position
+                    grid_pose=(p.x,p.y,yaw_of_quat(pose_snapshot.pose.orientation))
             with self.lock:
                 self.nearest_obstacle_m=closest
+                self.recovery_obstacle=(checked>=100 and corridor_ready and closest is not None and closest<=self.obstacle_stop_m)
+                if (grid is not None and grid.free and
+                        (self.recovery_sensor_stamp is None or sensor_stamp>self.recovery_sensor_stamp)):
+                    self.recovery_grid=grid
+                    self.recovery_grid_pose=grid_pose
+                    self.recovery_grid_stamp=now-max(0.,sensor_age) # conservative sensor age
+                    self.recovery_sensor_stamp=sensor_stamp
+                else:
+                    self.recovery_grid=None
                 clear=(checked>=100 and corridor_ready and
                        (closest is None or closest>self.obstacle_stop_m))
                 self.obstacle_ok=self.clearance.update(clear,time.time())
@@ -495,6 +561,7 @@ class Supervisor(object):
             with self.lock:
                 self.obstacle_ok=self.clearance.update(False,time.time())
                 self.obstacle_reason='無法檢查 LiDAR/TF：'+str(e)[:120]
+                self.recovery_grid=None; self.recovery_obstacle=False
 
     def publishers_ok(self):
         if not self.hardware:return True
@@ -515,9 +582,11 @@ class Supervisor(object):
         except Exception:return False
         return False
 
-    def healthy(self,now):
+    def healthy(self,now,ignore_forward=False,reversing=False):
         if self.fault_latched:return 'STOP: '+self.fault_latched
-        if self.complete:return 'GOAL: 路徑終點，已停止'
+        if self.complete:return 'GOAL: 最後一個 Waypoint 已依序抵達，已停止'
+        if self.progress_received and self.route is not None and self.progress_index == len(self.route):
+            return 'STOP: 上一輪 Waypoint 已完成；請停止後重新啟動導航'
         if self.pose_stable_since is None or now-self.pose_stable_since<2.5:
             return 'WAIT: NDT XY 位姿需連續穩定 2.5 秒後才可啟動'
         if self.pose_rate.age(now)>=self.pose_timeout:
@@ -555,8 +624,10 @@ class Supervisor(object):
         if self.ndt_stat.iteration>=29 or self.ndt_stat.exe_time<=0:
             return 'PAUSED: NDT 未收斂或運算時間無效'
         # exe_time is now used to scale speed; it alone does not stop motion.
-        if not self.obstacle_ok:return 'PAUSED: '+self.obstacle_reason
+        if not self.obstacle_ok and not ignore_forward:return 'PAUSED: '+self.obstacle_reason
         if self.route is None:return 'STOP: 尚無有效 Waypoint 路徑'
+        if not self.progress_received or now-self.stamps.get('progress',0)>2.0:
+            return 'PAUSED: 等待有效 Waypoint 進度回報'
         if not self.publishers_ok():return 'STOP: /cmd_vel 另有 Publisher 或無法驗證'
         if not self.hold:return 'WAIT: GUI 控制心跳尚未就緒'
         pose=self.pose.pose
@@ -603,27 +674,335 @@ class Supervisor(object):
                 if along>seg_length+0.20:
                     return ('STOP: Waypoint 進度卡在 WP01：沿起始路段已行進 {:.2f}m，'
                             '但尚未收到 WP02 進度；停止輸出，請檢查導航進度回報').format(along)
-        heading=nearest_route_heading(remaining_route,pose.position.x,pose.position.y)
+        if reversing:
+            # Recovery follows its own bounded arc. Keep normal cross-track
+            # limit and require the same local route, not a distant crossing.
+            local_d,_=distance_to_remaining(self.route,self.progress_index,
+                                pose.position.x,pose.position.y,max_forward_segments=3)
+            if local_d>self.max_cross_track_m:
+                return 'STOP: 脫困時偏離目前局部路徑'
+            return None
+        # A nearby return leg must not supply the heading for the current leg.
+        _,heading=distance_to_remaining(self.route,self.progress_index,
+                                       pose.position.x,pose.position.y,
+                                       max_forward_segments=2 if self.progress_index>0 else 1)
         if abs(wrap(yaw-heading))>0.70:
             return 'STOP: 車頭方向與最近路徑段差 {:.2f}rad'.format(abs(wrap(yaw-heading)))
-        dx=pose.position.x-self.route[-1]['x'];dy=pose.position.y-self.route[-1]['y']
-        if math.hypot(dx,dy)<0.55:
+        if final_waypoint_reached(self.route,self.progress_index,pose.position.x,pose.position.y,yaw):
             self.complete=True
-            return 'GOAL: 距離終點小於 0.55m，已停止'
+            return 'GOAL: 最後一個 Waypoint 已依序抵達，已停止'
         if self.cmd.twist.linear.x<=0:
             return 'STOP: Pure Pursuit 速度非正（可能正在等待路徑）'
         return None
+
+    def steering_values(self,curvature,velocity):
+        # Existing /offline_nav/twist_cmd is a yaw-rate TwistStamped.
+        # The uploaded hunter_ws /cmd_vel also uses yaw rate.
+        steering=getattr(self,'steering',None)
+        if steering is None:steering=HunterSteering('hunter1')
+        return steering.apply(curvature,velocity)
+
+    def recovery_eligible(self,now):
+        """Only a blocked bend or a geometrically verified tracking stop.
+        An arbitrary zero command, sensor loss, or other fault is NOT a
+        reverse authorization.
+        """
+        if (not self.ever_started or self.route is None or
+                self.progress_index<=0 or self.progress_index>=len(self.route)-1):
+            return None
+        err=self.healthy(now,ignore_forward=True)
+        heading=bool(err and err.startswith('STOP: 車頭方向與最近路徑段差'))
+        target=False
+        if err and err.startswith('STOP: Pure Pursuit 速度非正'):
+            # Independently verify the same geometric reason as direct PP.
+            # A normal controller STOP is never reinterpreted as permission
+            # to reverse. The recovery still requires an actual curved route.
+            cfg=self.recovery_config
+            speed=abs(self.last_odom_speed) if valid_number(self.last_odom_speed) else 0.
+            lookahead=max(getattr(cfg,'min_lookahead',getattr(cfg,'lookahead',2.)),
+                          getattr(cfg,'lookahead_ratio',1.17)*speed)
+            x,y,yaw=self.recovery_pose()
+            p=ordered_pursuit(self.route,self.progress_index,x,y,yaw,lookahead,.10)
+            target=(p['reason']=='target_not_ahead')
+        if err and not (heading or target):return None
+        if not (heading or target) and (self.obstacle_ok or not self.recovery_obstacle):
+            return None
+        if self.healthy(now,ignore_forward=True,reversing=True):return None
+        twist=self.cmd.twist
+        k=twist.angular.z/max(twist.linear.x,.05)
+        if not turn_ahead(self.route,self.progress_index,k):return None
+        return 'heading' if heading else 'target' if target else 'obstacle'
+
+    def recovery_pose(self):
+        p=self.pose.pose
+        return (p.position.x,p.position.y,yaw_of_quat(p.orientation))
+
+    def recovery_current_grid(self,now):
+        # This stricter age/pose gate applies only to recovery, never weakens
+        # the existing forward checks. Pose and scan timestamps must agree.
+        grid=self.recovery_grid
+        if (grid is None or self.recovery_grid_stamp is None or
+                now-self.recovery_grid_stamp>.65 or self.pose_rate.age(now)>.40 or
+                self.pose_rate.hz(now)<3.0 or self.recovery_grid_pose is None):
+            return None,None
+        p=relative(self.recovery_grid_pose,self.recovery_pose())
+        if math.hypot(p[0],p[1])>.15 or abs(p[2])>.20:
+            return None,None
+        return grid,p
+
+    def recovery_pause(self,reason):
+        self.started=False
+        self.publish_zero()
+        self.route_active_pub.publish(Bool(False))
+        self.pub_state(reason)
+
+    def recovery_abort(self,reason):
+        self.recovery_phase='FAILED'
+        self.fault_latched='脫困中止：'+reason+'；請停車並人工接管'
+        self.recovery_pause('STOP: '+self.fault_latched)
+
+    def recovery_markers(self,candidates,selected,frame):
+        arr=MarkerArray(); clear=Marker()
+        clear.header.frame_id='map';clear.header.stamp=rospy.Time.now()
+        clear.action=Marker.DELETEALL;arr.markers.append(clear)
+        for i,c in enumerate(candidates):
+            m=Marker();m.header=clear.header;m.ns='recovery_candidates';m.id=i
+            m.type=Marker.LINE_STRIP;m.action=Marker.ADD;m.pose.orientation.w=1.
+            m.scale.x=.085 if c is selected else .035
+            rgb=(.12,.95,1.) if c is selected else (.20,.85,.35) if c['ok'] else (.95,.18,.15)
+            m.color.r,m.color.g,m.color.b,m.color.a=rgb+(.92,)
+            for _,p in c['poses']:
+                x,y=transform(frame,p[0],p[1])
+                q=Point();q.x=x;q.y=y;q.z=.18; m.points.append(q)
+            arr.markers.append(m)
+        self.recovery_marker_pub.publish(arr)
+
+    def recovery_tick(self,now):
+        """Configured bend recovery; only this supervisor can publish motion.
+
+        IDLE -> REVERSING -> SETTLING -> original Pure Pursuit.
+        A fault/loss of fresh clearance at any stage latches STOP.
+        """
+        cfg=self.recovery_config
+        phase=self.recovery_phase
+        if phase=='FAILED':
+            self.recovery_pause('STOP: '+self.fault_latched)
+            return True
+        if phase in ('REVERSING','SETTLING'):
+            err=self.healthy(now,ignore_forward=True,reversing=True)
+            if err:
+                self.recovery_abort(err)
+                return True
+            if self.progress_index!=self.recovery_index:
+                self.recovery_abort('Waypoint 進度不一致')
+                return True
+            if not valid_number(self.last_odom_speed):
+                self.recovery_abort('底盤速度無效')
+                return True
+            if phase=='REVERSING' and self.recovery_pending_scan:
+                # No reverse until a fresh scan AFTER candidate selection.
+                if self.obstacle_ok and self.healthy(now) is None:
+                    self.recovery_phase='IDLE';self.recovery_wait_since=None
+                    self.recovery_tracking_blocked=False;self.recovery_trigger=None
+                    self.recovery_stationary_since=None
+                    self.recovery_attempts=max(0,self.recovery_attempts-1)
+                    self.recovery_pause('RECOVERY: 前方已淨空，取消尚未執行的倒車')
+                    return True
+                if (self.recovery_sensor_stamp is None or
+                        self.recovery_sensor_stamp<=self.recovery_plan_scan_stamp):
+                    if now-self.recovery_started_at>1.2:
+                        self.recovery_abort('選定候選後無新鮮點雲')
+                    else:
+                        self.recovery_pause('RECOVERY: 等待選定候選後的新鮮點雲')
+                    return True
+                if abs(self.last_odom_speed)>.035:
+                    self.recovery_abort('啟動後退前未停穩');return True
+                self.recovery_pending_scan=False
+            grid,current=self.recovery_current_grid(now)
+            if grid is None:
+                self.recovery_abort('後側點雲／位姿已逾時或覆蓋不足')
+                return True
+            self.route_active_pub.publish(Bool(False))
+            if phase=='SETTLING':
+                # Never switch from reverse to forward before measured stop.
+                self.publish_zero()
+                self.started=False
+                if abs(self.last_odom_speed)>.035:
+                    self.recovery_stationary_since=None
+                elif self.recovery_stationary_since is None:
+                    self.recovery_stationary_since=now
+                if now-self.recovery_stop_since>5.0 and (
+                        self.recovery_stationary_since is None or
+                        now-self.recovery_stationary_since<.5):
+                    self.recovery_abort('後退後車體未確認停穩');return True
+                if self.recovery_stationary_since is None or now-self.recovery_stationary_since<.5:
+                    self.pub_state('RECOVERY: 倒車結束，等待底盤停穩')
+                    return True
+                normal=self.healthy(now)
+                if normal is None:
+                    self.recovery_phase='IDLE'
+                    self.recovery_tracking_blocked=False;self.recovery_trigger=None
+                    self.recovery_wait_since=None;self.recovery_stationary_since=None
+                    self.recovery_markers([],None,self.recovery_grid_pose)
+                    self.pub_state('RECOVERY: 已停穩且前方安全檢查通過，準備接續原 Waypoint')
+                    return True
+                if now-self.recovery_stop_since<4.0:
+                    self.pub_state('RECOVERY: 後退完成，等待前方淨空及原路徑確認')
+                    return True
+                cause=self.recovery_eligible(now)
+                if cause and self.recovery_attempts<cfg.attempts:
+                    self.recovery_phase='IDLE'
+                    self.recovery_tracking_blocked=(cause in ('heading','target'))
+                    self.recovery_trigger=cause
+                    self.recovery_wait_since=now
+                    self.recovery_stationary_since=now
+                    self.pub_state('RECOVERY: 彎道仍未恢復，停車後重新評估候選路徑')
+                    return True
+                self.recovery_abort('未能安全接回原路徑或已達脫困次數上限')
+                return True
+            plan=self.recovery_plan
+            if self.recovery_motion_time>min(40.,plan['distance']/.015+4.):
+                self.recovery_abort('倒車逾時');return True
+            if self.last_odom_speed>.04 or abs(self.last_odom_speed)>cfg.speed+.05:
+                self.recovery_abort('實際底盤速度／方向與後退命令不符');return True
+            # Track the selected trajectory in map coordinates with NDT,
+            # not a fixed-duration blind command.
+            actual=self.recovery_pose()
+            nearest=min(plan['world'],key=lambda q: math.hypot(q[1][0]-actual[0],q[1][1]-actual[1]))
+            travel,expected=nearest
+            error=math.hypot(expected[0]-actual[0],expected[1]-actual[1])
+            yaw_error=abs(wrap(actual[2]-expected[2]))
+            if error>.13 or yaw_error>.22 or travel+.09<self.recovery_travel:
+                self.recovery_abort('偏離後退候選路徑');return True
+            self.recovery_travel=max(self.recovery_travel,travel)
+            remaining=max(0.,plan['distance']-self.recovery_travel)
+            if remaining<=.035:
+                self.recovery_phase='SETTLING';self.recovery_stop_since=now
+                self.recovery_stationary_since=None
+                self.recovery_pause('RECOVERY: 已到達後退目標，停車確認')
+                return True
+            # Re-check the ENTIRE remaining swept footprint against each
+            # fresh local grid, including corners, unknown cells and braking.
+            k=plan['curvature']
+            clear=grid.clear_arc(arc(current,-remaining,k,cfg.axle),current,extra=.07)
+            if not clear:
+                self.recovery_clear_gate.update(False,now)
+                self.recovery_blocked=True
+                self.recovery_clear_stamp=None
+                self.recovery_pause('RECOVERY WAIT: 後方／側方有障礙或未知格，停車等待淨空')
+                # Wait time is not commanded-motion time. No indefinite drive:
+                # actual travel and bounded attempts still govern the maneuver.
+                self.recovery_started_at=now
+                return True
+            if self.recovery_blocked:
+                if abs(self.last_odom_speed)>.035:
+                    self.recovery_clear_gate.update(False,now)
+                    self.recovery_clear_stamp=None
+                    self.recovery_pause('RECOVERY WAIT: 停車確認中')
+                    self.recovery_started_at=now
+                    return True
+                if self.recovery_clear_stamp!=self.recovery_sensor_stamp:
+                    self.recovery_clear_stamp=self.recovery_sensor_stamp
+                    ready=self.recovery_clear_gate.update(True,now)
+                else:
+                    ready=False
+                if not ready:
+                    self.recovery_pause('RECOVERY WAIT: 後方淨空持續確認中')
+                    self.recovery_started_at=now
+                    return True
+                self.recovery_blocked=False
+                self.recovery_clear_gate.update(False,now)
+                self.recovery_clear_stamp=None
+                self.recovery_started_at=now
+            speed_cap=min(cfg.speed,self.max_speed,
+                           adaptive_speed_cap(cfg.speed,self.ndt_stat.exe_time,self.pose_rate.hz(now)),
+                           math.sqrt(2.*.25*remaining))
+            dt=min(.10,max(0.,now-self.last_pub_time))
+            speed=min(speed_cap,abs(self.last_pub_v)+.20*dt)
+            if speed<=.005:
+                self.recovery_pause('RECOVERY: 等待可用低速命令');return True
+            # A signed velocity and matching yaw-rate are used. Both physical
+            # sign conventions and stopping response require commissioning.
+            self.recovery_motion_time+=dt
+            v=-speed
+            steer,k_applied,w=self.steering_values(k,v)
+            out=Twist();out.linear.x=v;out.angular.z=w
+            self.last_steer_cmd=steer
+            if self.cmd_pub:self.cmd_pub.publish(out)
+            t=TwistStamped();t.header.stamp=rospy.Time.now();t.twist=out
+            self.preview_pub.publish(t)
+            self.last_pub_v=v;self.last_pub_time=now;self.started=True
+            feedback=getattr(self,'last_steer_feedback',None)
+            self.pub_state('RECOVERY: 後退 {}/{}，WP{}/{} 凍結；cmd={:.2f}m/s, steer_pred={:+.3f}rad, steer_feedback={:+.3f}rad, yaw_cmd={:+.3f}rad/s, remaining={:.2f}m'.format(
+                self.recovery_attempts,cfg.attempts,self.recovery_index+1,len(self.route),v,steer,
+                feedback if feedback is not None else float('nan'),w,remaining))
+            return True
+        # IDLE: intercept actual blocked bends and tracking heading stops
+        # before the normal tick latches a STOP for heading error.
+        cause=self.recovery_eligible(now)
+        self.recovery_tracking_blocked=(cause in ('heading','target'))
+        self.recovery_trigger=cause
+        if not cause:
+            self.recovery_wait_since=None;self.recovery_stationary_since=None
+            return False
+        # Publish zero BEFORE planning; route progress remains frozen.
+        self.recovery_pause('RECOVERY: '+('彎道車頭偏差過大' if cause=='heading'
+                            else '彎道預瞄目標不再位於車前' if cause=='target'
+                            else '轉彎受阻')+'，停車評估後方空間')
+        if self.recovery_wait_since is None:self.recovery_wait_since=now
+        if not valid_number(self.last_odom_speed) or abs(self.last_odom_speed)>.035:
+            self.recovery_stationary_since=None
+            return True
+        if self.recovery_stationary_since is None:self.recovery_stationary_since=now
+        if now-self.recovery_wait_since<2.0 or now-self.recovery_stationary_since<.6:return True
+        if self.recovery_attempts>=cfg.attempts:
+            self.recovery_abort('已達脫困次數上限');return True
+        if now-self.recovery_last_plan<1.0:return True
+        self.recovery_last_plan=now
+        grid,current=self.recovery_current_grid(now)
+        if grid is None:
+            self.pub_state('RECOVERY: 後側感測尚未驗證／點雲未知，保持停車')
+            return True
+        route=local_route(self.route,self.progress_index,self.recovery_grid_pose, max_length=max(3.,getattr(cfg,'lookahead',2.)+.5))
+        plan,candidates=plan_reverse(grid,current,route,self.max_cross_track_m)
+        self.recovery_markers(candidates,plan,self.recovery_grid_pose)
+        if plan is None:
+            reasons=', '.join(sorted(set(c['reason'] for c in candidates)))
+            self.pub_state('RECOVERY WAIT: 無可行倒車候選（{}），保持停車並自動重評估'.format(reasons))
+            return True
+        plan['world']=[(d,transform(self.recovery_grid_pose,p[0],p[1])+
+                        (wrap(self.recovery_grid_pose[2]+p[2]),)) for d,p in plan['poses']]
+        self.recovery_plan=plan
+        self.recovery_index=self.progress_index
+        self.recovery_origin=self.recovery_pose()
+        self.recovery_attempts+=1
+        self.recovery_reset_index=self.progress_index
+        self.recovery_travel=0.
+        self.recovery_motion_time=0.
+        self.recovery_started_at=time.time()
+        self.recovery_phase='REVERSING'
+        self.recovery_plan_scan_stamp=self.recovery_sensor_stamp
+        self.recovery_pending_scan=True
+        self.recovery_blocked=True
+        self.recovery_clear_gate.update(False,now)
+        self.recovery_clear_stamp=None
+        self.pub_state('RECOVERY: 選定後退 {:.2f}m 曲率 {:+.2f} 1/m；等待下一筆掃描再執行'.format(
+            plan['distance'],plan['curvature']))
+        return True
 
     def publish_zero(self):
         if self.cmd_pub:self.cmd_pub.publish(Twist())
         t=TwistStamped();t.header.stamp=rospy.Time.now()
         self.preview_pub.publish(t)
         self.last_pub_v=0.0
+        self.last_steer_cmd=0.
         self.last_pub_time=time.time()
 
     def tick(self,_evt):
         now=time.time()
         with self.lock:
+            if getattr(self,'recovery_config',None) is not None and self.recovery_tick(now):
+                return
             err=self.healthy(now)
             if err:
                 if self.started:
@@ -662,9 +1041,8 @@ class Supervisor(object):
             if abs(curvature)>1e-6:
                 limit=min(limit,math.sqrt(0.80/abs(curvature)),0.50/abs(curvature))
             # Approach the final waypoint with a modeled deceleration envelope.
-            goal_dx=self.pose.pose.position.x-self.route[-1]['x']
-            goal_dy=self.pose.pose.position.y-self.route[-1]['y']
-            remaining=max(0.0,math.hypot(goal_dx,goal_dy)-0.55)
+            remaining=remaining_path_length(self.route,self.progress_index,
+                                            self.pose.pose.position.x,self.pose.pose.position.y)
             limit=min(limit,math.sqrt(2.0*0.65*remaining))
             v=min(limit,requested_v)
             if v<=0.005:
@@ -676,27 +1054,37 @@ class Supervisor(object):
             # Ramp up after initial start and after obstacle clearance.
             # Immediate stop requests are deliberately not delayed by ramping.
             v=min(v,self.last_pub_v+0.50*dt)
-            w=curvature*v
-            w=max(-0.50,min(0.50,w))
+            steer,applied_curvature,w=self.steering_values(curvature,v)
             self.last_pub_v=v
             self.last_pub_time=now
+            self.last_steer_cmd=steer
             out=Twist();out.linear.x=v;out.angular.z=w
             if self.cmd_pub:self.cmd_pub.publish(out)
             self.started=True
             self.ever_started=True
             self.route_active_pub.publish(Bool(True))
+            if getattr(self,'recovery_config',None) is not None:
+                self.recovery_tracking_blocked=False;self.recovery_trigger=None
+                self.recovery_wait_since=None
+                self.recovery_stationary_since=None
+                if (self.recovery_reset_index is not None and
+                        self.progress_index>=self.recovery_reset_index+2):
+                    self.recovery_attempts=0; self.recovery_reset_index=None
             report=TwistStamped();report.header.stamp=rospy.Time.now();report.twist=out
             self.preview_pub.publish(report)
             obstacle_text=('無近距離候選' if self.nearest_obstacle_m is None else
                            '{:.1f}m'.format(self.nearest_obstacle_m))
-            self.pub_state(('ACTIVE: WP{}/{}; cmd={:.2f}/{:.2f}m/s; forward={}; '
+            self.pub_state(('ACTIVE: WP{}/{}; remaining={:.2f}m; cmd={:.2f}/{:.2f}m/s; forward={}; '
                             'dev_full={:.2f}m; dev_rem={:.2f}m (limit={:.2f}m); '
                             'kappa_req={:+.3f} 1/m; kappa_out={:+.3f} 1/m; '
-                            'yaw_req={:+.3f}; yaw_out={:+.3f}rad/s; pose={:.1f}Hz; NDT={:.0f}ms').format(
-                self.progress_index+1,len(self.route),v,self.max_speed,obstacle_text,
+                            'yaw_req={:+.3f}; yaw_out={:+.3f}rad/s; steer_pred={:+.3f}rad; '
+                            'steer_feedback={:+.3f}rad; pose={:.1f}Hz; NDT={:.0f}ms').format(
+                self.progress_index+1,len(self.route),remaining,v,self.max_speed,obstacle_text,
                 self.last_cross_track_full if self.last_cross_track_full is not None else float('nan'),
                 self.last_cross_track_remaining if self.last_cross_track_remaining is not None else float('nan'),
-                self.max_cross_track_m,curvature,w/max(v,0.005),msg.angular.z,w,hz,self.ndt_stat.exe_time))
+                self.max_cross_track_m,curvature,applied_curvature,msg.angular.z,w,steer,
+                getattr(self,'last_steer_feedback',None) if getattr(self,'last_steer_feedback',None) is not None else float('nan'),
+                hz,self.ndt_stat.exe_time))
 
     def on_shutdown(self):
         for _ in range(8):
@@ -719,6 +1107,18 @@ def main():
     ap.add_argument('--obstacle-stop-m',type=float,default=2.40,help='Operator forward stopping distance, meters; may be increased by modeled speed clearance')
     ap.add_argument('--pose-timeout',type=float,default=1.0,help='pause after no new pose for this long (s)')
     ap.add_argument('--min-pose-hz',type=float,default=2.0,help='minimum validated recovery pose rate')
+    ap.add_argument('--recovery-enable',action='store_true')
+    ap.add_argument('--hunter-model',choices=('hunter1','hunter2'),default=None)
+    ap.add_argument('--lookahead-ratio',type=float,default=1.17)
+    ap.add_argument('--min-lookahead',type=float,default=2.)
+    ap.add_argument('--recovery-front',type=float,default=.70)
+    ap.add_argument('--recovery-rear',type=float,default=.50)
+    ap.add_argument('--recovery-axle',type=float,default=.35)
+    ap.add_argument('--recovery-radius',type=float,default=1.50)
+    ap.add_argument('--recovery-distance',type=float,default=.50)
+    ap.add_argument('--recovery-speed',type=float,default=.10)
+    ap.add_argument('--recovery-attempts',type=int,default=2)
+    ap.add_argument('--recovery-margin',type=float,default=.30)
     opts=ap.parse_args(rospy.myargv()[1:])
     rospy.init_node('hunter_nav_supervisor',anonymous=False)
     if opts.max_ndt_score<=0 or opts.max_ndt_score>10:ap.error("--max-ndt-score 需在 (0,10] 範圍")
@@ -730,16 +1130,35 @@ def main():
     if not 1.50<=opts.obstacle_stop_m<=10.0:ap.error('--obstacle-stop-m 必須在 [1.50,10.00] m')
     if not 0.8<=opts.pose_timeout<=1.5:ap.error('--pose-timeout 必須在 [0.8,1.5] s')
     if not 2.0<=opts.min_pose_hz<=10.0:ap.error('--min-pose-hz 必須在 [2,10] Hz')
+    if not .1<=opts.lookahead_ratio<=20. or not .1<=opts.min_lookahead<=30.:ap.error('Invalid lookahead parameters')
+    recovery=None
+    if opts.recovery_enable:
+        try:
+            recovery=RecoveryConfig(opts.vehicle_width_m,opts.recovery_front,opts.recovery_rear,
+                opts.recovery_axle,opts.recovery_radius,opts.recovery_distance,
+                opts.recovery_speed,opts.recovery_attempts,opts.recovery_margin)
+            recovery.lookahead=max(opts.min_lookahead,opts.lookahead_ratio*opts.recovery_speed)
+            recovery.min_lookahead=opts.min_lookahead
+            recovery.lookahead_ratio=opts.lookahead_ratio
+        except ValueError as exc:ap.error(str(exc))
+    # Uploaded driver auto-detects protocol but does not export model.
+    model=opts.hunter_model or rospy.get_param('/hunter_base_node/robot_model','hunter1')
+    try:steering=HunterSteering(model)
+    except ValueError as exc:ap.error(str(exc))
     x=Supervisor(hardware=opts.hardware,max_ndt_score=opts.max_ndt_score,
                  max_speed=opts.max_speed,pose_timeout=opts.pose_timeout,min_pose_hz=opts.min_pose_hz,
                  vehicle_width_m=opts.vehicle_width_m,max_cross_track_m=opts.max_cross_track_m,
                  obstacle_stop_m=opts.obstacle_stop_m,
-                 corridor_half_width_m=opts.corridor_half_width_m)
+                 corridor_half_width_m=opts.corridor_half_width_m,recovery_config=recovery,steering=steering)
     rospy.Timer(rospy.Duration(1.0/x.RATE),x.tick)
     rospy.logwarn('SUPERVISOR OUTPUT MODE: %s', 'REAL HARDWARE' if opts.hardware else 'DRY RUN, /cmd_vel DISABLED')
     rospy.logwarn('HUNTER CORRIDOR: half=%.2fm total=%.2fm; measured vehicle=%.2fm; side margin=%.2fm each (not collision certified)',x.route_corridor_half_width,x.route_corridor_half_width*2,x.vehicle_width_m,x.route_corridor_side_margin_m)
     rospy.logwarn('ROUTE DEVIATION: remaining-route stop limit=%.2fm; full-route and remaining-route errors are logged separately',x.max_cross_track_m)
     rospy.logwarn('OBSTACLE STOP: GUI requested=%.2fm effective=%.2fm (speed/braking model floor); near-body guard=%.2fm; side ROI is diagnostic, walls in swept route still STOP',x.obstacle_stop_requested_m,x.obstacle_stop_m,x.immediate_front_guard_m)
+    rospy.logwarn('HUNTER_WS YAW-RATE interface: geometry model=%s wheelbase=%.3fm central limit=%.3frad; /cmd_vel angular.z is rad/s (driver converts to steering)',steering.model,steering.wheelbase,steering.max_angle)
+    if steering.model in ('hunter1','hunter'):rospy.logwarn('AGX_V1 steering_angle feedback unavailable in supplied SDK; use NDT pose for motion, not undefined angle')
+    if recovery is not None:rospy.logwarn('RECOVERY physical radius %.2fm',recovery.radius)
+    rospy.logwarn('RECOVERY: %s', 'ON; obstacle OR bend heading/target error; automatic rear-clear waiting; not safety-rated' if recovery else 'OFF')
     rospy.spin()
 
 if __name__=='__main__':main()

@@ -88,8 +88,8 @@ Visualization Manager:
     Namespaces: {}
     Value: true
   - Class: rviz/Path
-    Enabled: true
-    Name: Remaining Waypoint Route (green)
+    Enabled: false
+    Name: Remaining Waypoint Route (legacy optional)
     Topic: /hunter_nav/remaining_route
     Color: 70; 245; 100
     Alpha: 1.0
@@ -118,8 +118,22 @@ Visualization Manager:
     Value: true
   - Class: rviz/MarkerArray
     Enabled: true
+    Name: Trajectory Feasibility (green/yellow/red/gray)
+    Marker Topic: /hunter_nav/feasibility_markers
+    Queue Size: 10
+    Namespaces: {}
+    Value: true
+  - Class: rviz/MarkerArray
+    Enabled: true
     Name: Route Corridor + Obstacle Diagnostics
     Marker Topic: /hunter_nav/obstacle_markers
+    Queue Size: 10
+    Namespaces: {}
+    Value: true
+  - Class: rviz/MarkerArray
+    Enabled: true
+    Name: Recovery Candidates (cyan selected)
+    Marker Topic: /hunter_nav/recovery_markers
     Queue Size: 10
     Namespaces: {}
     Value: true

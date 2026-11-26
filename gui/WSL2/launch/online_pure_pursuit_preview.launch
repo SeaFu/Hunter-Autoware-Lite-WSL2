@@ -1,8 +1,11 @@
 <launch>
   <arg name="min_lookahead" default="1.5" />
   <arg name="lookahead_ratio" default="2.0" />
+  <arg name="direct_ordered_pp" default="true" />
+  <!-- CSV bridge now publishes twist_raw directly; never run both PP sources.
+       Legacy LaneArray mode still uses the stock C++ node. -->
   <!-- PREVIEW ONLY: output stays /offline_nav/*, NEVER remap to /cmd_vel. -->
-  <node pkg="pure_pursuit" type="pure_pursuit" name="hunter_preview_pure_pursuit" output="screen">
+  <node unless="$(arg direct_ordered_pp)" pkg="pure_pursuit" type="pure_pursuit" name="hunter_preview_pure_pursuit" output="screen">
     <param name="velocity_source" value="0" />
     <param name="minimum_lookahead_distance" value="$(arg min_lookahead)" />
     <param name="lookahead_ratio" value="$(arg lookahead_ratio)" />

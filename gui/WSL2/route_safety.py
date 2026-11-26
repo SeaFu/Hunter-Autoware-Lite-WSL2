@@ -30,6 +30,16 @@ def load_route(path):
                 raise ValueError('第 {} 行有無效數值'.format(n))
             if not all((not math.isnan(value) and not math.isinf(value)) for value in item.values()):
                 raise ValueError('第 {} 行存在 NaN/Inf'.format(n))
+            # Extended feasibility columns are optional; old 6-column CSV
+            # remains valid, and numerical navigation validation is unchanged.
+            if 'segment_status' in row:
+                st=(row.get('segment_status') or 'PENDING').strip().upper()
+                item['segment_status']=st if st in ('PASS','WARN','FAIL','PENDING') else 'PENDING'
+                item['segment_reason']=(row.get('segment_reason') or '').strip()
+                item['check_profile']=(row.get('check_profile') or '').strip()
+                for field in ('min_radius_m','predicted_error_m','clearance_m'):
+                    try:item[field]=float(row[field]) if row.get(field,'').strip() else None
+                    except (ValueError,TypeError):item[field]=None
             points.append(item)
     return points
 
