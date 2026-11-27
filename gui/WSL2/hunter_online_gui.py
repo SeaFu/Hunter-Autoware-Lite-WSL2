@@ -44,11 +44,14 @@ def ros_cmd(args, hunter=False):
     if hunter:
         script += ('test -f "$HOME/hunter_ws/devel/setup.bash" || '
                    '{ echo "找不到 ~/hunter_ws/devel/setup.bash" >&2; exit 2; }; ')
-    autoware = os.environ.get('AUTOWARE_LIVE_WS', os.path.join(HOME, 'autoware.ai'))
-    overlay = os.path.join(autoware, 'install', 'setup.bash')
-    script += 'if [ -f ' + shlex.quote(overlay) + ' ]; then source ' + shlex.quote(overlay) + '; fi; '
+    # hunter_ws/devel/setup.bash resets ROS_PACKAGE_PATH to its own chain
+    # (hunter_ws + /opt/ros), so it must come first; the Autoware overlay is
+    # then stacked on top with local_setup.bash so lidar_localizer etc. stay visible.
     script += ('if [ -f "$HOME/hunter_ws/devel/setup.bash" ]; then '
                'source "$HOME/hunter_ws/devel/setup.bash"; fi; ')
+    autoware = os.environ.get('AUTOWARE_LIVE_WS', os.path.join(HOME, 'autoware.ai'))
+    overlay = os.path.join(autoware, 'install', 'local_setup.bash')
+    script += 'if [ -f ' + shlex.quote(overlay) + ' ]; then source ' + shlex.quote(overlay) + '; fi; '
     script += 'exec ' + ' '.join(shlex.quote(str(a)) for a in args)
     return ['bash', '-lc', script]
 
