@@ -3,7 +3,7 @@
 這份專案說明 Hunter 移動機器人在 **Windows 11 / WSL2（Ubuntu 18.04、ROS Melodic）** 下的 CAN、VLP-16、NDT 建圖／定位與 Waypoint 路徑跟隨。教學設計給第一次接手的使用者，並與 [Autoware-Lite 離線版](https://github.com/SeaFu/autoware-lite) 分開。
 
 **最短閱讀路線**：已有可用 CAN 核心與 ROS 環境 → 直接看 **[第 7 節：雙 GUI](#hunter-gui)**；換新電腦但需要 CAN 核心 → 在方式 A／B **二選一**，完成後再看第 7 節。無須將每一章的手動檢查命令都執行一遍。
-
+sudo apt install -y libasio-dev
 
 ## 目錄
 
